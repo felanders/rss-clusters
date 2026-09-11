@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import DOMPurify from 'isomorphic-dompurify'
 import { useRouter } from 'next/navigation'
 import { ChevronDown, ChevronRight, Circle, ExternalLink, LogOut, Pencil, Plus, RefreshCw, Settings2, Trash2, X } from 'lucide-react'
-import { addFeed, deleteFeed, listArticles, listClusters, listFeeds, reclusterArticles, refreshAndClusterAll, refreshAllFeeds, updateFeed } from '@/app/actions/feeds'
+import { addFeed, deleteFeed, listArticles, listClusters, listFeeds, listReadArticleIds, markArticleRead, reclusterArticles, refreshAndClusterAll, refreshAllFeeds, updateFeed } from '@/app/actions/feeds'
 import { signOut, useSession } from '@/lib/auth-client'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -24,16 +24,11 @@ export default function Page() {
   const [reclustering, setReclustering] = useState(false)
 
   useEffect(() => {
-    const saved = window.sessionStorage.getItem('newsroom-viewed-articles')
-    if (saved) setViewed(JSON.parse(saved))
-  }, [])
-
-  useEffect(() => {
     if (!session) return
     let cancelled = false
     const load = async () => {
-      const [nextFeeds, nextArticles, nextClusters] = await Promise.all([listFeeds(), listArticles(), listClusters()])
-      if (!cancelled) { setFeeds(nextFeeds); setArticles(nextArticles); setClusters(nextClusters) }
+      const [nextFeeds, nextArticles, nextClusters, readIds] = await Promise.all([listFeeds(), listArticles(), listClusters(), listReadArticleIds()])
+      if (!cancelled) { setFeeds(nextFeeds); setArticles(nextArticles); setClusters(nextClusters); setViewed(readIds) }
     }
     load().catch(() => {}).finally(() => { if (!cancelled) setLoading(false) })
     return () => { cancelled = true }
@@ -46,8 +41,8 @@ export default function Page() {
       setRefreshing(true)
       try {
         await refreshAndClusterAll()
-        const [nextFeeds, nextArticles, nextClusters] = await Promise.all([listFeeds(), listArticles(), listClusters()])
-        if (!cancelled) { setFeeds(nextFeeds); setArticles(nextArticles); setClusters(nextClusters) }
+        const [nextFeeds, nextArticles, nextClusters, readIds] = await Promise.all([listFeeds(), listArticles(), listClusters(), listReadArticleIds()])
+        if (!cancelled) { setFeeds(nextFeeds); setArticles(nextArticles); setClusters(nextClusters); setViewed(readIds) }
       } catch (error) {
         console.error('[v0] Automatic refresh and clustering failed:', error)
       } finally {
@@ -59,12 +54,8 @@ export default function Page() {
   }, [session])
 
   function markViewed(id: string) {
-    setViewed((current) => {
-      if (current.includes(id)) return current
-      const next = [...current, id]
-      window.sessionStorage.setItem('newsroom-viewed-articles', JSON.stringify(next))
-      return next
-    })
+    setViewed((current) => current.includes(id) ? current : [...current, id])
+    void markArticleRead(id).catch((error) => console.error('[v0] Failed to persist read state:', error))
   }
 
   async function refresh() {
