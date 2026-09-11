@@ -73,19 +73,29 @@ function updatedCentroid(oldCentroid: number[], embedding: number[], articleCoun
   return embedding.map((value, index) => ((oldCentroid[index] * articleCount) + value) / (articleCount + 1))
 }
 
-async function generateArticleEmbedding(title: string, summary: string | null) {
+async function generateArticleEmbeddings(items: Array<{ title: string; summary: string | null }>) {
   const token = await getToken(OPENROUTER_CONNECTOR, { subject: { type: 'app' } })
-  const response = await fetch('https://openrouter.ai/api/v1/embeddings', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'X-Title': 'Clustered RSS Feeds' },
-    body: JSON.stringify({ model: EMBEDDING_MODEL, input: `${title}\n${(summary ?? '').slice(0, 1200)}` }),
-    signal: AbortSignal.timeout(30000),
-  })
-  if (!response.ok) throw new Error(`Embedding request failed (${response.status})`)
-  const payload = await response.json() as { data?: Array<{ embedding?: number[] }> }
-  const embedding = payload.data?.[0]?.embedding
-  if (!embedding?.length || embedding.some((value) => !Number.isFinite(value))) throw new Error('Embedding response was invalid')
-  return embedding
+  let response: Response | undefined
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    response = await fetch('https://openrouter.ai/api/v1/embeddings', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'X-Title': 'Clustered RSS Feeds' },
+      body: JSON.stringify({ model: EMBEDDING_MODEL, input: items.map((item) => `${item.title}\n${(item.summary ?? '').slice(0, 1200)}`) }),
+      signal: AbortSignal.timeout(60000),
+    })
+    if (response.ok) break
+    if (response.status !== 429 || attempt === 3) {
+      const detail = (await response.text()).slice(0, 240)
+      throw new Error(`Embedding request failed (${response.status}): ${detail}`)
+    }
+    const retryAfter = Number(response.headers.get('retry-after') ?? 0)
+    await new Promise((resolve) => setTimeout(resolve, Math.max(retryAfter * 1000, 2000 * (attempt + 1))))
+  }
+  if (!response?.ok) throw new Error('Embedding request failed after retries')
+  const payload = await response.json() as { data?: Array<{ index?: number; embedding?: number[] }> }
+  const embeddings = [...(payload.data ?? [])].sort((left, right) => (left.index ?? 0) - (right.index ?? 0)).map((item) => item.embedding)
+  if (embeddings.length !== items.length || embeddings.some((embedding) => !embedding?.length || embedding.some((value) => !Number.isFinite(value)))) throw new Error('Embedding response was invalid')
+  return embeddings as number[][]
 }
 
 async function synthesizeCluster(clusterId: string, userId: string) {
@@ -102,8 +112,7 @@ async function verifyClusterMatch(item: { title: string; summary: string | null 
   return result.related
 }
 
-async function assignArticleToCluster(item: { id: string; userId: string; title: string; summary: string | null }, userId: string) {
-  const embedding = await generateArticleEmbedding(item.title, item.summary)
+async function assignArticleToCluster(item: { id: string; userId: string; title: string; summary: string | null }, userId: string, embedding: number[]) {
   const activeClusters = await db.select({ id: cluster.id, centroid: cluster.centroid, canonicalTitle: cluster.canonicalTitle, articleCount: cluster.articleCount }).from(cluster).where(and(eq(cluster.userId, userId), gt(cluster.lastUpdatedAt, new Date(Date.now() - 36 * 60 * 60 * 1000))))
   const best = activeClusters.reduce<{ candidate: ClusterCandidate | null; score: number }>((result, current) => {
     const score = cosineSimilarity(embedding, current.centroid)
@@ -177,14 +186,26 @@ export async function reclusterArticles() {
   await db.update(article).set({ clusterId: null, embedding: null }).where(eq(article.userId, id))
   let processed = 0
   const errors: string[] = []
-  for (const item of rows) {
+  const batchSize = 16
+  for (let start = 0; start < rows.length; start += batchSize) {
+    const batch = rows.slice(start, start + batchSize)
+    let embeddings: number[][]
     try {
-      await assignArticleToCluster(item, id)
-      processed += 1
+      embeddings = await generateArticleEmbeddings(batch)
     } catch (error) {
+      const message = error instanceof Error ? error.message : 'Embedding request failed'
+      errors.push(`Batch ${start + 1}-${start + batch.length}: ${message}`)
+      continue
+    }
+    for (const [index, item] of batch.entries()) {
+      try {
+        await assignArticleToCluster(item, id, embeddings[index])
+        processed += 1
+      } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown clustering error'
       errors.push(`${item.title.slice(0, 80)}: ${message}`)
-      console.error('[v0] Article clustering failed:', item.id, error)
+        console.error('[v0] Article clustering failed:', item.id, error)
+      }
     }
   }
   revalidatePath('/')
@@ -231,7 +252,8 @@ export async function refreshFeed(feedId: string) {
       const inserted = await db.insert(article).values({ id: crypto.randomUUID(), feedId: current.id, userId: id, title: item.title.slice(0, 500), url: item.url.slice(0, 2000), summary: item.summary.slice(0, 5000) || null, author: item.author.slice(0, 300) || null, publishedAt: item.publishedAt ? new Date(item.publishedAt) : null, guid: item.guid.slice(0, 1000) || null }).onConflictDoNothing({ target: [article.feedId, article.url] }).returning({ id: article.id, title: article.title, summary: article.summary })
       if (inserted[0]) {
         try {
-          await assignArticleToCluster({ ...inserted[0], userId: id }, id)
+          const [embedding] = await generateArticleEmbeddings([{ title: inserted[0].title, summary: inserted[0].summary }])
+      await assignArticleToCluster({ ...inserted[0], userId: id }, id, embedding)
         } catch (error) {
           console.error('[v0] Article embedding failed:', inserted[0].id, error)
         }
