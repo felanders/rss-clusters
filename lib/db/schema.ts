@@ -27,7 +27,7 @@ export const feed = pgTable('feed', {
 }, (table) => ({ userUrl: unique().on(table.userId, table.url) }))
 
 export const article = pgTable('article', {
-  id: text('id').primaryKey(), feedId: text('feedId').notNull(), userId: text('userId').notNull(), title: text('title').notNull(), url: text('url').notNull(), summary: text('summary'), author: text('author'), publishedAt: timestamp('publishedAt'), guid: text('guid'), embedding: jsonb('embedding').$type<number[]>(), clusterId: text('clusterId'), createdAt: timestamp('createdAt').notNull().defaultNow(),
+  id: text('id').primaryKey(), feedId: text('feedId').notNull(), userId: text('userId').notNull(), title: text('title').notNull(), url: text('url').notNull(), summary: text('summary'), author: text('author'), publishedAt: timestamp('publishedAt'), guid: text('guid'), embedding: jsonb('embedding').$type<number[]>(), clusterId: text('clusterId'), readAt: timestamp('readAt'), createdAt: timestamp('createdAt').notNull().defaultNow(),
 }, (table) => ({ feedUrl: unique().on(table.feedId, table.url) }))
 
 export const cluster = pgTable('cluster', {

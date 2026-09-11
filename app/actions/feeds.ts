@@ -2,7 +2,7 @@
 
 import { generateObject, gateway } from 'ai'
 import { XMLParser } from 'fast-xml-parser'
-import { and, desc, eq, gt, isNull } from 'drizzle-orm'
+import { and, desc, eq, gt, isNotNull, isNull } from 'drizzle-orm'
 import { z } from 'zod'
 import { headers } from 'next/headers'
 import { revalidatePath } from 'next/cache'
@@ -147,6 +147,18 @@ export async function listFeeds() {
 export async function listArticles() {
   const id = await userId()
   return db.select().from(article).where(eq(article.userId, id)).orderBy(desc(article.publishedAt), desc(article.createdAt)).limit(100)
+}
+
+export async function markArticleRead(articleId: string) {
+  const id = await userId()
+  await db.update(article).set({ readAt: new Date() }).where(and(eq(article.id, articleId), eq(article.userId, id)))
+  revalidatePath('/')
+}
+
+export async function listReadArticleIds() {
+  const id = await userId()
+  const rows = await db.select({ id: article.id }).from(article).where(and(eq(article.userId, id), isNotNull(article.readAt)))
+  return rows.map((row) => row.id)
 }
 
 export async function listClusters() {
