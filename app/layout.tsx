@@ -3,7 +3,7 @@ import type { Metadata, Viewport } from 'next'
 import './globals.css'
 
 export const metadata: Metadata = {
-  title: 'Local Newsroom · A quieter way to read the news',
+  title: 'Clustered RSS Feeds · A quieter way to read the news',
   description: 'A personal, self-hosted RSS reader that groups related stories into clear news clusters.',
   generator: 'v0.app',
   icons: {
@@ -26,11 +26,8 @@ export const metadata: Metadata = {
 }
 
 export const viewport: Viewport = {
-  colorScheme: 'light dark',
-  themeColor: [
-    { media: '(prefers-color-scheme: light)', color: 'white' },
-    { media: '(prefers-color-scheme: dark)', color: 'black' },
-  ],
+  colorScheme: 'light',
+  themeColor: 'white',
 }
 
 export default function RootLayout({

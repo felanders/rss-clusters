@@ -1,8 +1,8 @@
 'use server'
 
-import { generateObject, gateway } from 'ai'
+import { getToken } from '@vercel/connect'
 import { XMLParser } from 'fast-xml-parser'
-import { and, desc, eq, gt, isNull } from 'drizzle-orm'
+import { and, desc, eq, gt, isNotNull } from 'drizzle-orm'
 import { z } from 'zod'
 import { headers } from 'next/headers'
 import { revalidatePath } from 'next/cache'
@@ -10,7 +10,8 @@ import { auth } from '@/lib/auth'
 import { db } from '@/lib/db'
 import { article, cluster, feed } from '@/lib/db/schema'
 
-async function userId() {
+async function userId(override?: string) {
+  if (override) return override
   const session = await auth.api.getSession({ headers: await headers() })
   if (!session?.user) throw new Error('Unauthorized')
   return session.user.id
@@ -32,8 +33,25 @@ function link(value: unknown) {
   return ''
 }
 
-const synthesisModel = gateway('inclusionai/ling-3.0-flash-sante')
-const LOCAL_EMBEDDING_DIMENSIONS = 256
+const OPENROUTER_CONNECTOR = 'openrouter.ai/clustered-rss-feeds-openrouter'
+const NEMOTRON_MODEL = 'nvidia/nemotron-3.5-lightning:free'
+
+async function callNemotron<T>(prompt: string, schema: z.ZodType<T>): Promise<T> {
+  const token = await getToken(OPENROUTER_CONNECTOR, { subject: { type: 'app' } })
+  const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'X-Title': 'Clustered RSS Feeds' },
+    body: JSON.stringify({ model: NEMOTRON_MODEL, temperature: 0.1, messages: [{ role: 'user', content: prompt }], response_format: { type: 'json_object' } }),
+    signal: AbortSignal.timeout(30000),
+  })
+  if (!response.ok) throw new Error(`Nemotron request failed (${response.status})`)
+  const payload = await response.json() as { choices?: Array<{ message?: { content?: string } }> }
+  const content = payload.choices?.[0]?.message?.content
+  if (!content) throw new Error('Nemotron returned no content')
+  return schema.parse(JSON.parse(content))
+}
+
+const EMBEDDING_MODEL = 'nvidia/nemotron-3-embed-1b:free'
 const LOCAL_CLUSTER_THRESHOLD = 0.55
 
 type ClusterCandidate = { id: string; centroid: number[]; canonicalTitle: string; articleCount: number }
@@ -56,50 +74,48 @@ function updatedCentroid(oldCentroid: number[], embedding: number[], articleCoun
   return embedding.map((value, index) => ((oldCentroid[index] * articleCount) + value) / (articleCount + 1))
 }
 
-function generateArticleEmbedding(title: string, summary: string | null) {
-  const tokens = `${title} ${(summary ?? '').slice(0, 300)}`
-    .toLocaleLowerCase()
-    .normalize('NFKD')
-    .replace(/[^\p{L}\p{N}]+/gu, ' ')
-    .split(/\s+/)
-    .filter((token) => token.length > 2)
-  const embedding = Array.from({ length: LOCAL_EMBEDDING_DIMENSIONS }, () => 0)
-  for (const token of tokens) {
-    let hash = 2166136261
-    for (let index = 0; index < token.length; index += 1) {
-      hash ^= token.charCodeAt(index)
-      hash = Math.imul(hash, 16777619)
+async function generateArticleEmbeddings(items: Array<{ title: string; summary: string | null }>) {
+  const token = await getToken(OPENROUTER_CONNECTOR, { subject: { type: 'app' } })
+  let response: Response | undefined
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    response = await fetch('https://openrouter.ai/api/v1/embeddings', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'X-Title': 'Clustered RSS Feeds' },
+      body: JSON.stringify({ model: EMBEDDING_MODEL, input: items.map((item) => `${item.title}\n${(item.summary ?? '').slice(0, 1200)}`) }),
+      signal: AbortSignal.timeout(60000),
+    })
+    if (response.ok) break
+    const detail = (await response.text()).slice(0, 240)
+    if (response.status === 429) {
+      throw new Error(detail.includes('free-models-per-day') || detail.includes('rate limit') ? 'OpenRouter embedding quota is exhausted. Clustering stopped without replacing persisted data.' : `OpenRouter rate limit reached. Try again later. ${detail}`)
     }
-    embedding[(hash >>> 0) % LOCAL_EMBEDDING_DIMENSIONS] += 1
+    if (response.status !== 408 && response.status !== 500 && response.status !== 502 && response.status !== 503 || attempt === 3) {
+      throw new Error(`Embedding request failed (${response.status}): ${detail}`)
+    }
+    await new Promise((resolve) => setTimeout(resolve, 2000 * (attempt + 1)))
   }
-  const magnitude = Math.sqrt(embedding.reduce((sum, value) => sum + value ** 2, 0))
-  return magnitude === 0 ? embedding : embedding.map((value) => value / magnitude)
+  if (!response?.ok) throw new Error('Embedding request failed after retries')
+  const payload = await response.json() as { data?: Array<{ index?: number; embedding?: number[] }> }
+  const embeddings = [...(payload.data ?? [])].sort((left, right) => (left.index ?? 0) - (right.index ?? 0)).map((item) => item.embedding)
+  if (embeddings.length !== items.length || embeddings.some((embedding) => !embedding?.length || embedding.some((value) => !Number.isFinite(value)))) throw new Error('Embedding response was invalid')
+  return embeddings as number[][]
 }
 
 async function synthesizeCluster(clusterId: string, userId: string) {
   const rows = await db.select().from(article).where(and(eq(article.userId, userId), eq(article.clusterId, clusterId))).orderBy(desc(article.publishedAt)).limit(20)
   if (rows.length < 2) return
-  const result = await generateObject({
-    model: synthesisModel,
-    schema: z.object({ canonical_title: z.string(), summary: z.array(z.string()).length(2) }),
-    prompt: `You are a neutral news editor. Combine these related headlines and summaries into one concise canonical headline (max 12 words) and 2 key takeaway bullets. Return only the requested JSON fields.\n\n${rows.map((row) => `Headline: ${row.title}\nSummary: ${row.summary ?? ''}`).join('\n\n')}`,
-  })
-  await db.update(cluster).set({ canonicalTitle: result.object.canonical_title.slice(0, 500), summary: result.object.summary.map((item) => item.slice(0, 500)), lastUpdatedAt: new Date() }).where(and(eq(cluster.id, clusterId), eq(cluster.userId, userId)))
+  const result = await callNemotron(`You are a neutral news editor. Combine these related headlines and summaries into one concise canonical headline (max 12 words) and 2 key takeaway bullets. Return only JSON with canonical_title and summary.\n\n${rows.map((row) => `Headline: ${row.title}\nSummary: ${row.summary ?? ''}`).join('\n\n')}`, z.object({ canonical_title: z.string(), summary: z.array(z.string()).length(2) }))
+  await db.update(cluster).set({ canonicalTitle: result.canonical_title.slice(0, 500), summary: result.summary.map((item: string) => item.slice(0, 500)), lastUpdatedAt: new Date() }).where(and(eq(cluster.id, clusterId), eq(cluster.userId, userId)))
 }
 
 async function verifyClusterMatch(item: { title: string; summary: string | null }, candidate: ClusterCandidate, score: number, userId: string) {
   const related = await db.select({ title: article.title, summary: article.summary }).from(article).where(and(eq(article.userId, userId), eq(article.clusterId, candidate.id))).orderBy(desc(article.publishedAt)).limit(5)
   if (related.length === 0) return false
-  const result = await generateObject({
-    model: synthesisModel,
-    schema: z.object({ related: z.boolean(), reason: z.string().max(240) }),
-    prompt: `Decide whether this incoming news article reports the same real-world story as the existing cluster. Shared topic alone is not enough; require the same event, people, place, or development. Return related=true only when grouping is editorially defensible.\n\nIncoming article:\nHeadline: ${item.title}\nSummary: ${item.summary ?? ''}\n\nExisting cluster (${candidate.articleCount} articles, local similarity ${score.toFixed(3)}):\n${related.map((row) => `Headline: ${row.title}\nSummary: ${row.summary ?? ''}`).join('\n\n')}`,
-  })
-  return result.object.related
+  const result = await callNemotron(`Decide whether this incoming news article reports the same real-world story as the existing cluster. Shared topic alone is not enough; require the same event, people, place, or development. Return related=true only when grouping is editorially defensible. Return JSON with related and reason.\n\nIncoming article:\nHeadline: ${item.title}\nSummary: ${item.summary ?? ''}\n\nExisting cluster (${candidate.articleCount} articles, local similarity ${score.toFixed(3)}):\n${related.map((row) => `Headline: ${row.title}\nSummary: ${row.summary ?? ''}`).join('\n\n')}`, z.object({ related: z.boolean(), reason: z.string().max(240) }))
+  return result.related
 }
 
-async function assignArticleToCluster(item: { id: string; userId: string; title: string; summary: string | null }, userId: string) {
-  const embedding = generateArticleEmbedding(item.title, item.summary)
+async function assignArticleToCluster(item: { id: string; userId: string; title: string; summary: string | null }, userId: string, embedding: number[]) {
   const activeClusters = await db.select({ id: cluster.id, centroid: cluster.centroid, canonicalTitle: cluster.canonicalTitle, articleCount: cluster.articleCount }).from(cluster).where(and(eq(cluster.userId, userId), gt(cluster.lastUpdatedAt, new Date(Date.now() - 36 * 60 * 60 * 1000))))
   const best = activeClusters.reduce<{ candidate: ClusterCandidate | null; score: number }>((result, current) => {
     const score = cosineSimilarity(embedding, current.centroid)
@@ -146,7 +162,19 @@ export async function listFeeds() {
 
 export async function listArticles() {
   const id = await userId()
-  return db.select().from(article).where(eq(article.userId, id)).orderBy(desc(article.publishedAt), desc(article.createdAt)).limit(100)
+  return db.select().from(article).where(eq(article.userId, id)).orderBy(desc(article.publishedAt), desc(article.createdAt))
+}
+
+export async function markArticleRead(articleId: string) {
+  const id = await userId()
+  await db.update(article).set({ readAt: new Date() }).where(and(eq(article.id, articleId), eq(article.userId, id)))
+  revalidatePath('/')
+}
+
+export async function listReadArticleIds() {
+  const id = await userId()
+  const rows = await db.select({ id: article.id }).from(article).where(and(eq(article.userId, id), isNotNull(article.readAt)))
+  return rows.map((row) => row.id)
 }
 
 export async function listClusters() {
@@ -154,20 +182,40 @@ export async function listClusters() {
   return db.select().from(cluster).where(eq(cluster.userId, id)).orderBy(desc(cluster.lastUpdatedAt))
 }
 
-export async function reclusterArticles() {
-  const id = await userId()
-  const rows = await db.select({ id: article.id, userId: article.userId, title: article.title, summary: article.summary }).from(article).where(and(eq(article.userId, id), isNull(article.clusterId)))
-  let processed = 0
-  for (const item of rows) {
+export async function reclusterArticles(scheduledUserId?: string) {
+  const id = await userId(scheduledUserId)
+  const rows = await db.select({ id: article.id, userId: article.userId, title: article.title, summary: article.summary }).from(article).where(eq(article.userId, id))
+  const allEmbeddings: number[][] = []
+  const errors: string[] = []
+  const batchSize = 16
+  for (let start = 0; start < rows.length; start += batchSize) {
+    const batch = rows.slice(start, start + batchSize)
     try {
-      await assignArticleToCluster(item, id)
+      allEmbeddings.push(...await generateArticleEmbeddings(batch))
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Embedding request failed'
+      errors.push(`Batch ${start + 1}-${start + batch.length}: ${message}`)
+    }
+  }
+  if (errors.length > 0 || allEmbeddings.length !== rows.length) {
+    return { processed: 0, total: rows.length, errors: [...errors, 'Existing persisted embeddings and clusters were preserved.'] }
+  }
+
+  await db.delete(cluster).where(eq(cluster.userId, id))
+  await db.update(article).set({ clusterId: null }).where(eq(article.userId, id))
+  let processed = 0
+  for (const [index, item] of rows.entries()) {
+    try {
+      await assignArticleToCluster(item, id, allEmbeddings[index])
       processed += 1
     } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown clustering error'
+      errors.push(`${item.title.slice(0, 80)}: ${message}`)
       console.error('[v0] Article clustering failed:', item.id, error)
     }
   }
   revalidatePath('/')
-  return { processed, total: rows.length }
+  return { processed, total: rows.length, errors }
 }
 
 export async function addFeed(rawUrl: string) {
@@ -198,8 +246,8 @@ export async function deleteFeed(feedId: string) {
   revalidatePath('/')
 }
 
-export async function refreshFeed(feedId: string) {
-  const id = await userId()
+export async function refreshFeed(feedId: string, scheduledUserId?: string) {
+  const id = await userId(scheduledUserId)
   const rows = await db.select().from(feed).where(and(eq(feed.id, feedId), eq(feed.userId, id)))
   const current = rows[0]
   if (!current) throw new Error('Feed not found')
@@ -210,7 +258,8 @@ export async function refreshFeed(feedId: string) {
       const inserted = await db.insert(article).values({ id: crypto.randomUUID(), feedId: current.id, userId: id, title: item.title.slice(0, 500), url: item.url.slice(0, 2000), summary: item.summary.slice(0, 5000) || null, author: item.author.slice(0, 300) || null, publishedAt: item.publishedAt ? new Date(item.publishedAt) : null, guid: item.guid.slice(0, 1000) || null }).onConflictDoNothing({ target: [article.feedId, article.url] }).returning({ id: article.id, title: article.title, summary: article.summary })
       if (inserted[0]) {
         try {
-          await assignArticleToCluster({ ...inserted[0], userId: id }, id)
+          const [embedding] = await generateArticleEmbeddings([{ title: inserted[0].title, summary: inserted[0].summary }])
+      await assignArticleToCluster({ ...inserted[0], userId: id }, id, embedding)
         } catch (error) {
           console.error('[v0] Article embedding failed:', inserted[0].id, error)
         }
@@ -227,15 +276,16 @@ export async function refreshFeed(feedId: string) {
   revalidatePath('/')
 }
 
-export async function refreshAllFeeds() {
-  const rows = await listFeeds()
-  const results = await Promise.allSettled(rows.map((item) => refreshFeed(item.id)))
+export async function refreshAllFeeds(scheduledUserId?: string) {
+  const id = await userId(scheduledUserId)
+  const rows = await db.select().from(feed).where(eq(feed.userId, id))
+  const results = await Promise.allSettled(rows.map((item) => refreshFeed(item.id, id)))
   revalidatePath('/')
   return { refreshed: results.filter((result) => result.status === 'fulfilled').length, total: rows.length }
 }
 
-export async function refreshAndClusterAll() {
-  const refreshResult = await refreshAllFeeds()
-  const clusterResult = await reclusterArticles()
+export async function refreshAndClusterAll(scheduledUserId?: string) {
+  const refreshResult = await refreshAllFeeds(scheduledUserId)
+  const clusterResult = await reclusterArticles(scheduledUserId)
   return { ...refreshResult, ...clusterResult }
 }
