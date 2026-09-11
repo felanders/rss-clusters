@@ -3,7 +3,7 @@ import type { Metadata, Viewport } from 'next'
 import './globals.css'
 
 export const metadata: Metadata = {
-  title: 'Local Newsroom · A quieter way to read the news',
+  title: 'Clustered RSS Feeds · A quieter way to read the news',
   description: 'A personal, self-hosted RSS reader that groups related stories into clear news clusters.',
   generator: 'v0.app',
   icons: {
