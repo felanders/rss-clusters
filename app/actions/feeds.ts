@@ -84,12 +84,14 @@ async function generateArticleEmbeddings(items: Array<{ title: string; summary: 
       signal: AbortSignal.timeout(60000),
     })
     if (response.ok) break
-    if (response.status !== 429 || attempt === 3) {
-      const detail = (await response.text()).slice(0, 240)
+    const detail = (await response.text()).slice(0, 240)
+    if (response.status === 429) {
+      throw new Error(detail.includes('free-models-per-day') || detail.includes('rate limit') ? 'OpenRouter embedding quota is exhausted. Clustering stopped without replacing persisted data.' : `OpenRouter rate limit reached. Try again later. ${detail}`)
+    }
+    if (response.status !== 408 && response.status !== 500 && response.status !== 502 && response.status !== 503 || attempt === 3) {
       throw new Error(`Embedding request failed (${response.status}): ${detail}`)
     }
-    const retryAfter = Number(response.headers.get('retry-after') ?? 0)
-    await new Promise((resolve) => setTimeout(resolve, Math.max(retryAfter * 1000, 2000 * (attempt + 1))))
+    await new Promise((resolve) => setTimeout(resolve, 2000 * (attempt + 1)))
   }
   if (!response?.ok) throw new Error('Embedding request failed after retries')
   const payload = await response.json() as { data?: Array<{ index?: number; embedding?: number[] }> }
