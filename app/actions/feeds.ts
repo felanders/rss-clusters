@@ -182,30 +182,33 @@ export async function listClusters() {
 export async function reclusterArticles() {
   const id = await userId()
   const rows = await db.select({ id: article.id, userId: article.userId, title: article.title, summary: article.summary }).from(article).where(eq(article.userId, id))
-  await db.delete(cluster).where(eq(cluster.userId, id))
-  await db.update(article).set({ clusterId: null, embedding: null }).where(eq(article.userId, id))
-  let processed = 0
+  const allEmbeddings: number[][] = []
   const errors: string[] = []
   const batchSize = 16
   for (let start = 0; start < rows.length; start += batchSize) {
     const batch = rows.slice(start, start + batchSize)
-    let embeddings: number[][]
     try {
-      embeddings = await generateArticleEmbeddings(batch)
+      allEmbeddings.push(...await generateArticleEmbeddings(batch))
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Embedding request failed'
       errors.push(`Batch ${start + 1}-${start + batch.length}: ${message}`)
-      continue
     }
-    for (const [index, item] of batch.entries()) {
-      try {
-        await assignArticleToCluster(item, id, embeddings[index])
-        processed += 1
-      } catch (error) {
+  }
+  if (errors.length > 0 || allEmbeddings.length !== rows.length) {
+    return { processed: 0, total: rows.length, errors: [...errors, 'Existing persisted embeddings and clusters were preserved.'] }
+  }
+
+  await db.delete(cluster).where(eq(cluster.userId, id))
+  await db.update(article).set({ clusterId: null }).where(eq(article.userId, id))
+  let processed = 0
+  for (const [index, item] of rows.entries()) {
+    try {
+      await assignArticleToCluster(item, id, allEmbeddings[index])
+      processed += 1
+    } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown clustering error'
       errors.push(`${item.title.slice(0, 80)}: ${message}`)
-        console.error('[v0] Article clustering failed:', item.id, error)
-      }
+      console.error('[v0] Article clustering failed:', item.id, error)
     }
   }
   revalidatePath('/')
