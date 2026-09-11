@@ -44,7 +44,7 @@ export default function Page() {
       setClusterLogs(['Loading feeds…', 'Refreshing stories…', 'Reclustering all articles with Vercel AI Gateway…'])
       try {
         const result = await refreshAndClusterAll()
-        setClusterLogs((current) => [...current, `Processed ${result.processed} of ${result.total} articles.`, result.errors.length ? `${result.errors.length} articles failed.` : 'Clustering completed successfully.'])
+        setClusterLogs((current) => [...current, `Processed ${result.processed} of ${result.total} articles.`, result.errors.length ? `${result.errors.length} articles failed: ${result.errors.slice(0, 2).join(' | ')}` : 'Clustering completed successfully.'])
         const [nextFeeds, nextArticles, nextClusters] = await Promise.all([listFeeds(), listArticles(), listClusters()])
         if (!cancelled) { setFeeds(nextFeeds); setArticles(nextArticles); setClusters(nextClusters) }
       } catch (error) {
