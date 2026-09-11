@@ -15,7 +15,7 @@ function isScheduledBerlinTime(now = new Date()) {
   }).formatToParts(now)
   const hour = Number(parts.find((part) => part.type === 'hour')?.value)
   const minute = Number(parts.find((part) => part.type === 'minute')?.value)
-  return minute === 0 && [7, 10, 13, 17].includes(hour)
+  return minute === 0 && hour === 7
 }
 
 export async function GET(request: Request) {
