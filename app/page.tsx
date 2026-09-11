@@ -36,27 +36,6 @@ export default function Page() {
     return () => { cancelled = true }
   }, [session])
 
-  useEffect(() => {
-    if (!session) return
-    let cancelled = false
-    const sync = async () => {
-      setRefreshing(true)
-      setClusterLogs(['Loading feeds…', 'Refreshing stories…', 'Reclustering all articles with Vercel AI Gateway…'])
-      try {
-        const result = await refreshAndClusterAll()
-        setClusterLogs((current) => [...current, `Processed ${result.processed} of ${result.total} articles.`, result.errors.length ? `${result.errors.length} articles failed: ${result.errors.slice(0, 2).join(' | ')}` : 'Clustering completed successfully.'])
-        const [nextFeeds, nextArticles, nextClusters] = await Promise.all([listFeeds(), listArticles(), listClusters()])
-        if (!cancelled) { setFeeds(nextFeeds); setArticles(nextArticles); setClusters(nextClusters) }
-      } catch (error) {
-        console.error('[v0] Automatic refresh and clustering failed:', error)
-      } finally {
-        if (!cancelled) setRefreshing(false)
-      }
-    }
-    sync()
-    return () => { cancelled = true }
-  }, [session])
-
   async function markViewed(id: string) {
     if (viewed.includes(id)) return
     try {
@@ -149,7 +128,7 @@ function FeedSettings({ feeds, onAdded, onClose }: { feeds: Feed[]; onAdded: (fe
     catch (error) { setError(error instanceof Error ? error.message : 'Unable to delete feed.'); setSaving(false) }
   }
 
-  return <div className="fixed inset-y-0 right-0 z-20 w-full max-w-md border-l border-neutral-200 bg-white p-6 shadow-2xl sm:p-8"><div className="flex items-center justify-between"><div><p className="text-xs font-medium uppercase tracking-[0.16em] text-neutral-400">Settings</p><h2 className="mt-1 text-2xl font-semibold tracking-[-0.04em]">Feeds</h2></div><Button variant="ghost" size="icon" aria-label="Close settings" onClick={onClose}><X /></Button></div><form onSubmit={submit} className="mt-8 flex gap-2"><Input value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://example.com/feed.xml" aria-label="RSS feed URL" /><Button type="submit" disabled={saving} className="bg-black text-white hover:bg-neutral-800"><Plus />Add</Button></form>{error && <p role="alert" className="mt-3 text-xs text-red-600">{error}</p>}<div className="mt-8 divide-y divide-neutral-100 border-y border-neutral-200">{feeds.map((item) => <div key={item.id} className="py-4">{editing === item.id ? <div className="flex flex-col gap-2"><Input value={draftName} onChange={(event) => setDraftName(event.target.value)} aria-label="Feed name" /><Input value={draftCategory} onChange={(event) => setDraftCategory(event.target.value)} aria-label="Feed category" /><div className="flex justify-end gap-2"><Button type="button" variant="ghost" size="sm" onClick={() => setEditing(null)}>Cancel</Button><Button type="button" size="sm" disabled={saving} onClick={() => saveEdit(item)} className="bg-black text-white hover:bg-neutral-800">Save</Button></div></div> : <div className="flex items-center justify-between gap-3"><div className="min-w-0"><div className="truncate text-sm">{item.name}</div><div className="mt-1 text-xs text-neutral-400">{item.category} · {item.status}</div></div><div className="flex shrink-0 items-center gap-1"><Button variant="ghost" size="icon" aria-label={`Edit ${item.name}`} onClick={() => startEditing(item)}><Pencil /></Button><Button variant="ghost" size="icon" aria-label={`Delete ${item.name}`} onClick={() => remove(item)} disabled={saving}><Trash2 /></Button></div></div>}</div>)}</div></div>
+  return <div className="fixed inset-y-0 right-0 z-20 w-full max-w-md border-l border-neutral-200 bg-white p-6 shadow-2xl sm:p-8"><div className="flex items-center justify-between"><div><p className="text-xs font-medium uppercase tracking-[0.16em] text-neutral-400">Settings</p><h2 className="mt-1 text-2xl font-semibold tracking-[-0.04em]">Feeds</h2></div><Button variant="ghost" size="icon" aria-label="Close settings" onClick={onClose}><X /></Button></div><form onSubmit={submit} className="mt-8 flex gap-2"><Input value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://example.com/feed.xml" aria-label="RSS feed URL" /><Button type="submit" disabled={saving} className="bg-black text-white hover:bg-neutral-800"><Plus />Add</Button></form>{error && <p role="alert" className="mt-3 text-xs text-red-600">{error}</p>}<div className="mt-8 max-h-[min(60vh,520px)] overflow-y-auto overscroll-contain divide-y divide-neutral-100 border-y border-neutral-200">{feeds.map((item) => <div key={item.id} className="py-4">{editing === item.id ? <div className="flex flex-col gap-2"><Input value={draftName} onChange={(event) => setDraftName(event.target.value)} aria-label="Feed name" /><Input value={draftCategory} onChange={(event) => setDraftCategory(event.target.value)} aria-label="Feed category" /><div className="flex justify-end gap-2"><Button type="button" variant="ghost" size="sm" onClick={() => setEditing(null)}>Cancel</Button><Button type="button" size="sm" disabled={saving} onClick={() => saveEdit(item)} className="bg-black text-white hover:bg-neutral-800">Save</Button></div></div> : <div className="flex items-center justify-between gap-3"><div className="min-w-0"><div className="truncate text-sm">{item.name}</div><div className="mt-1 text-xs text-neutral-400">{item.category} · {item.status}</div></div><div className="flex shrink-0 items-center gap-1"><Button variant="ghost" size="icon" aria-label={`Edit ${item.name}`} onClick={() => startEditing(item)}><Pencil /></Button><Button variant="ghost" size="icon" aria-label={`Delete ${item.name}`} onClick={() => remove(item)} disabled={saving}><Trash2 /></Button></div></div>}</div>)}</div></div>
 }
 
 function decodeEntities(value: string) {
