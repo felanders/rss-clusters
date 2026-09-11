@@ -146,7 +146,7 @@ export async function listFeeds() {
 
 export async function listArticles() {
   const id = await userId()
-  return db.select().from(article).where(eq(article.userId, id)).orderBy(desc(article.publishedAt), desc(article.createdAt)).limit(100)
+  return db.select().from(article).where(eq(article.userId, id)).orderBy(desc(article.publishedAt), desc(article.createdAt))
 }
 
 export async function markArticleRead(articleId: string) {
