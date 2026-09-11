@@ -153,6 +153,38 @@
   }
 }
 
+/* Keep the app and browser chrome white even when Safari prefers dark mode. */
+:root {
+  color-scheme: light;
+  --background: #ffffff;
+  --foreground: #111111;
+  --card: #ffffff;
+  --card-foreground: #111111;
+  --popover: #ffffff;
+  --popover-foreground: #111111;
+  --primary: #111111;
+  --primary-foreground: #ffffff;
+  --secondary: #f5f5f5;
+  --secondary-foreground: #111111;
+  --muted: #f5f5f5;
+  --muted-foreground: #737373;
+  --accent: #f5f5f5;
+  --accent-foreground: #111111;
+  --border: #e5e5e5;
+  --input: #e5e5e5;
+  --ring: #111111;
+}
+
+.reader-row { grid-auto-flow: column; align-items: center; white-space: nowrap; }
+.reader-row > :nth-child(2) { grid-column: 3; }
+.reader-row > :nth-child(3) { grid-column: 2; }
+.reader-row > :nth-child(4) { grid-column: 4; }
+.reader-row > :nth-child(5) { grid-column: 5; }
+.reader-row > span { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.reader-row + div,
+.reader-row + div > div { box-sizing: border-box; width: 100% !important; margin: 0 !important; padding: 8px 12px 8px 50px !important; text-align: left; line-height: 1.5; }
+.reader-row + div * { margin-left: 0 !important; padding-left: 0 !important; max-width: none; }
+
 @layer base {
   * {
     @apply border-border outline-ring/50;
