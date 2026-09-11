@@ -2,7 +2,7 @@
 
 import { generateObject, gateway } from 'ai'
 import { XMLParser } from 'fast-xml-parser'
-import { and, desc, eq, gt, isNotNull, isNull } from 'drizzle-orm'
+import { and, desc, eq, gt, isNotNull } from 'drizzle-orm'
 import { z } from 'zod'
 import { headers } from 'next/headers'
 import { revalidatePath } from 'next/cache'
@@ -168,18 +168,23 @@ export async function listClusters() {
 
 export async function reclusterArticles() {
   const id = await userId()
-  const rows = await db.select({ id: article.id, userId: article.userId, title: article.title, summary: article.summary }).from(article).where(and(eq(article.userId, id), isNull(article.clusterId)))
+  const rows = await db.select({ id: article.id, userId: article.userId, title: article.title, summary: article.summary }).from(article).where(eq(article.userId, id))
+  await db.delete(cluster).where(eq(cluster.userId, id))
+  await db.update(article).set({ clusterId: null, embedding: null }).where(eq(article.userId, id))
   let processed = 0
+  const errors: string[] = []
   for (const item of rows) {
     try {
       await assignArticleToCluster(item, id)
       processed += 1
     } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown clustering error'
+      errors.push(`${item.title.slice(0, 80)}: ${message}`)
       console.error('[v0] Article clustering failed:', item.id, error)
     }
   }
   revalidatePath('/')
-  return { processed, total: rows.length }
+  return { processed, total: rows.length, errors }
 }
 
 export async function addFeed(rawUrl: string) {
