@@ -10,7 +10,8 @@ import { auth } from '@/lib/auth'
 import { db } from '@/lib/db'
 import { article, cluster, feed } from '@/lib/db/schema'
 
-async function userId() {
+async function userId(override?: string) {
+  if (override) return override
   const session = await auth.api.getSession({ headers: await headers() })
   if (!session?.user) throw new Error('Unauthorized')
   return session.user.id
@@ -181,8 +182,8 @@ export async function listClusters() {
   return db.select().from(cluster).where(eq(cluster.userId, id)).orderBy(desc(cluster.lastUpdatedAt))
 }
 
-export async function reclusterArticles() {
-  const id = await userId()
+export async function reclusterArticles(scheduledUserId?: string) {
+  const id = await userId(scheduledUserId)
   const rows = await db.select({ id: article.id, userId: article.userId, title: article.title, summary: article.summary }).from(article).where(eq(article.userId, id))
   const allEmbeddings: number[][] = []
   const errors: string[] = []
@@ -245,8 +246,8 @@ export async function deleteFeed(feedId: string) {
   revalidatePath('/')
 }
 
-export async function refreshFeed(feedId: string) {
-  const id = await userId()
+export async function refreshFeed(feedId: string, scheduledUserId?: string) {
+  const id = await userId(scheduledUserId)
   const rows = await db.select().from(feed).where(and(eq(feed.id, feedId), eq(feed.userId, id)))
   const current = rows[0]
   if (!current) throw new Error('Feed not found')
@@ -275,15 +276,16 @@ export async function refreshFeed(feedId: string) {
   revalidatePath('/')
 }
 
-export async function refreshAllFeeds() {
-  const rows = await listFeeds()
-  const results = await Promise.allSettled(rows.map((item) => refreshFeed(item.id)))
+export async function refreshAllFeeds(scheduledUserId?: string) {
+  const id = await userId(scheduledUserId)
+  const rows = await db.select().from(feed).where(eq(feed.userId, id))
+  const results = await Promise.allSettled(rows.map((item) => refreshFeed(item.id, id)))
   revalidatePath('/')
   return { refreshed: results.filter((result) => result.status === 'fulfilled').length, total: rows.length }
 }
 
-export async function refreshAndClusterAll() {
-  const refreshResult = await refreshAllFeeds()
-  const clusterResult = await reclusterArticles()
+export async function refreshAndClusterAll(scheduledUserId?: string) {
+  const refreshResult = await refreshAllFeeds(scheduledUserId)
+  const clusterResult = await reclusterArticles(scheduledUserId)
   return { ...refreshResult, ...clusterResult }
 }
