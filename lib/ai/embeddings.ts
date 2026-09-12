@@ -1,12 +1,16 @@
-import { devError, devLog } from './openrouter'
+import {
+  devError,
+  devLog,
+  openRouterClient,
+} from './openrouter'
 
 /**
  * OpenRouter has no embeddings endpoint, so embeddings use a separate
  * OpenAI-compatible provider. Implemented with plain `fetch` to avoid adding a
  * provider dependency.
  */
-const EMBEDDINGS_API_URL = process.env.EMBEDDINGS_API_URL ?? 'https://api.openai.com/v1'
-const EMBEDDINGS_MODEL = process.env.EMBEDDINGS_MODEL ?? 'text-embedding-3-small'
+const EMBEDDINGS_API_URL = process.env.OPENROUTER_API_URL 
+const EMBEDDINGS_MODEL = string(process.env.OPENROUTER_EMBEDDINGS_MODEL)
 
 const EMBEDDING_TIMEOUT_MS = 60_000
 const SUMMARY_CHAR_LIMIT = 1_200
@@ -37,21 +41,16 @@ export async function generateArticleEmbeddings(
   devLog('Embedding request started', { model: EMBEDDINGS_MODEL, articleCount: items.length })
 
   try {
-    const response = await fetch(`${EMBEDDINGS_API_URL}/embeddings`, {
-      method: 'POST',
-      headers: { authorization: `Bearer ${apiKey}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ model: EMBEDDINGS_MODEL, input: items.map(embeddingValue) }),
-      signal: AbortSignal.timeout(EMBEDDING_TIMEOUT_MS),
-      cache: 'no-store',
-    })
+    const openrouter = await openRouterClient()
+    const embedding = await openrouter.embeddings.generate({
+      requestBody: {
+        model: EMBEDDINGS_MODEL,
+        input: items.map(embeddingValue),
+        encodingFormat: "float"
+      }
+    });
 
-    const payload = (await response.json()) as EmbeddingsResponse
-
-    if (!response.ok) {
-      throw new Error(payload.error?.message ?? `Embedding provider returned ${response.status}`)
-    }
-
-    const embeddings = [...(payload.data ?? [])]
+    const embeddings = [...(embedding.data ?? [])]
       .sort((left, right) => (left.index ?? 0) - (right.index ?? 0))
       .map((entry) => entry.embedding)
 

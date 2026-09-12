@@ -19,13 +19,13 @@ function requireEnv(value: string | undefined, name: string) {
 export async function openRouterProvider() {
   const connector = requireEnv(process.env.OPENROUTER_CONNECTOR_UID, 'OPENROUTER_CONNECTOR_UID')
   const apiKey = await getToken(connector, { subject: { type: 'app' } })
-  return createOpenRouter({ apiKey, baseURL: OPENROUTER_API_URL })
+  return createOpenRouter({ apiKey: apiKey })
 }
 
 export async function openRouterClient() {
   const connector = requireEnv(process.env.OPENROUTER_CONNECTOR_UID, 'OPENROUTER_CONNECTOR_UID')
   const apiKey = await getToken(connector, { subject: { type: 'app' } })
-  return new OpenRouter({ apiKey, serverURL: OPENROUTER_API_URL })
+  return new OpenRouter({apiKey: apiKey })
 }
 
 const isDevelopment = process.env.NODE_ENV !== 'production'
