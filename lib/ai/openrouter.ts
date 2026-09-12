@@ -3,23 +3,11 @@ import { OpenRouter } from '@openrouter/sdk'
 import { getToken } from '@vercel/connect'
 
 export const CLUSTER_VERIFICATION_MODEL =
-  process.env.OPENROUTER_CLUSTER_VERIFICATION_MODEL ?? 'google/gemini-2.5-flash-lite'
-
-const OPENROUTER_API_URL = process.env.OPENROUTER_API_URL ?? 'https://openrouter.ai/api/v1'
+  process.env.OPENROUTER_CLUSTER_VERIFICATION_MODEL ?? 'google/gemini-3.5-flash-lite'
 
 function requireEnv(value: string | undefined, name: string) {
   if (!value) throw new Error(`${name} is not configured`)
   return value
-}
-
-/**
- * Resolves a short-lived OpenRouter credential through Vercel Connect.
- * Validated lazily so a missing env var cannot break the module import.
- */
-export async function openRouterProvider() {
-  const connector = requireEnv(process.env.OPENROUTER_CONNECTOR_UID, 'OPENROUTER_CONNECTOR_UID')
-  const apiKey = await getToken(connector, { subject: { type: 'app' } })
-  return createOpenRouter({ apiKey: apiKey })
 }
 
 export async function openRouterClient() {
