@@ -1,6 +1,6 @@
 'use server'
 
-import { generateText } from 'ai'
+import { embedMany, generateText } from 'ai'
 import { createOpenRouter } from '@openrouter/ai-sdk-provider'
 import { getToken } from '@vercel/connect'
 import { XMLParser } from 'fast-xml-parser'
@@ -50,11 +50,15 @@ function devError(message: string, error: unknown) {
   if (isDevelopment) console.error(`[v0] ${message}`, error)
 }
 
+async function getOpenRouter() {
+  const token = await getToken(OPENROUTER_CONNECTOR_UID!, { subject: { type: 'app' } })
+  return createOpenRouter({ apiKey: token, baseURL: OPENROUTER_API_URL, headers: { 'X-Title': OPENROUTER_APP_TITLE } })
+}
+
 async function callClusterModel<T>(prompt: string, schema: z.ZodType<T>): Promise<T> {
   devLog('Cluster model request started', { model: CLUSTER_VERIFICATION_MODEL, promptLength: prompt.length })
   try {
-    const token = await getToken(OPENROUTER_CONNECTOR_UID!, { subject: { type: 'app' } })
-    const openrouter = createOpenRouter({ apiKey: token })
+    const openrouter = await getOpenRouter()
     const { text: responseText } = await generateText({
       model: openrouter(CLUSTER_VERIFICATION_MODEL),
       prompt,
@@ -98,34 +102,17 @@ function updatedCentroid(oldCentroid: number[], embedding: number[], articleCoun
 async function generateArticleEmbeddings(items: Array<{ title: string; summary: string | null }>, userId: string) {
   devLog('Embedding request started', { model: EMBEDDING_MODEL, articleCount: items.length })
   try {
-    const token = await getToken(OPENROUTER_CONNECTOR_UID!, { subject: { type: 'app' } })
-    let response: Response | undefined
-    for (let attempt = 0; attempt < 4; attempt += 1) {
-      devLog('Embedding attempt started', { attempt: attempt + 1, articleCount: items.length })
-      response = await fetch(`${OPENROUTER_API_URL.replace(/\/$/, '')}/embeddings`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'X-Title': OPENROUTER_APP_TITLE },
-        body: JSON.stringify({ model: EMBEDDING_MODEL, input: items.map((item) => `${item.title}\n${(item.summary ?? '').slice(0, 1200)}`) }),
-        signal: AbortSignal.timeout(60000),
-      })
-      devLog('Embedding response received', { attempt: attempt + 1, status: response.status, ok: response.ok })
-      if (response.ok) break
-      const detail = (await response.text()).slice(0, 240)
-      devError('Embedding request returned an error', { attempt: attempt + 1, status: response.status, detail })
-      if (response.status === 429) {
-        throw new Error(detail.includes('free-models-per-day') || detail.includes('rate limit') ? 'OpenRouter embedding quota is exhausted. Clustering stopped without replacing persisted data.' : `OpenRouter rate limit reached. Try again later. ${detail}`)
-      }
-      if (response.status !== 408 && response.status !== 500 && response.status !== 502 && response.status !== 503 || attempt === 3) {
-        throw new Error(`Embedding request failed (${response.status}): ${detail}`)
-      }
-      await new Promise((resolve) => setTimeout(resolve, 2000 * (attempt + 1)))
-    }
-    if (!response?.ok) throw new Error('Embedding request failed after retries')
-    const payload = await response.json() as { data?: Array<{ index?: number; embedding?: number[] }> }
-    const embeddings = [...(payload.data ?? [])].sort((left, right) => (left.index ?? 0) - (right.index ?? 0)).map((item) => item.embedding)
-    devLog('Embedding payload parsed', { returned: embeddings.length, expected: items.length, dimensions: embeddings[0]?.length ?? 0 })
+    const openrouter = await getOpenRouter()
+    const values = items.map((item) => `${item.title}\n${(item.summary ?? '').slice(0, 1200)}`)
+    const { embeddings } = await embedMany({
+      model: openrouter.embedding(EMBEDDING_MODEL),
+      values,
+      maxRetries: 3,
+      abortSignal: AbortSignal.timeout(60000),
+    })
+    devLog('Embedding response received', { returned: embeddings.length, expected: items.length, dimensions: embeddings[0]?.length ?? 0 })
     if (embeddings.length !== items.length || embeddings.some((embedding) => !embedding?.length || embedding.some((value) => !Number.isFinite(value)))) throw new Error('Embedding response was invalid')
-    return embeddings as number[][]
+    return embeddings
   } catch (error) {
     devError('Embedding request failed', error)
     throw error
