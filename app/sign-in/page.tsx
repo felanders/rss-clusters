@@ -17,7 +17,7 @@ export default function SignInPage() {
     event.preventDefault(); setPending(true); setError('')
     try {
       const result = isSignIn ? await signIn.email({ email, password }) : await signUp.email({ email, password, name: email.split('@')[0] })
-      if (result.error) setError('We could not authenticate with those details. Check your email and password, then try again.')
+      if (result.error) setError(!isSignIn && result.error.message ? result.error.message : 'We could not authenticate with those details. Check your email and password, then try again.')
       else { router.replace('/'); router.refresh() }
     } catch {
       setError('The login service is temporarily unavailable. Please try again.')

@@ -23,11 +23,28 @@ export const verification = pgTable('verification', {
 })
 
 export const feed = pgTable('feed', {
-  id: text('id').primaryKey(), userId: text('userId').notNull(), name: text('name').notNull(), url: text('url').notNull(), category: text('category').notNull().default('Uncategorized'), status: text('status').notNull().default('Pending sync'), lastSyncedAt: timestamp('lastSyncedAt'), lastError: text('lastError'), createdAt: timestamp('createdAt').notNull().defaultNow(), updatedAt: timestamp('updatedAt').notNull().defaultNow(),
+  id: text('id').primaryKey(), userId: text('userId').notNull(), name: text('name').notNull(), url: text('url').notNull(), category: text('category').notNull().default('Uncategorized'),
+  // 'rss': every entry is an article. 'newsletter': every entry is an email issue (e.g. a Kill the Newsletter feed) that an LLM splits into stories.
+  kind: text('kind').$type<FeedKind>().notNull().default('rss'),
+  status: text('status').notNull().default('Pending sync'), lastSyncedAt: timestamp('lastSyncedAt'), lastError: text('lastError'), createdAt: timestamp('createdAt').notNull().defaultNow(), updatedAt: timestamp('updatedAt').notNull().defaultNow(),
 }, (table) => ({ userUrl: unique().on(table.userId, table.url) }))
 
+export type FeedKind = 'rss' | 'newsletter'
+
+/** One received newsletter email. Its stories live in `article` (linked via issueId) once it has been split. */
+export const issue = pgTable('issue', {
+  id: text('id').primaryKey(), feedId: text('feedId').notNull(), userId: text('userId').notNull(), title: text('title').notNull(), url: text('url').notNull(), content: text('content').notNull(), publishedAt: timestamp('publishedAt'),
+  processedAt: timestamp('processedAt'), itemCount: integer('itemCount'), lastError: text('lastError'), createdAt: timestamp('createdAt').notNull().defaultNow(),
+}, (table) => ({ feedUrl: unique().on(table.feedId, table.url) }))
+
 export const article = pgTable('article', {
-  id: text('id').primaryKey(), feedId: text('feedId').notNull(), userId: text('userId').notNull(), title: text('title').notNull(), url: text('url').notNull(), summary: text('summary'), author: text('author'), publishedAt: timestamp('publishedAt'), guid: text('guid'), embedding: jsonb('embedding').$type<number[]>(), clusterId: text('clusterId'), readAt: timestamp('readAt'), createdAt: timestamp('createdAt').notNull().defaultNow(),
+  id: text('id').primaryKey(), feedId: text('feedId').notNull(), userId: text('userId').notNull(), title: text('title').notNull(), url: text('url').notNull(), summary: text('summary'), author: text('author'), publishedAt: timestamp('publishedAt'), guid: text('guid'),
+  // Embedding of "title + summary", produced right after retrieval. `embeddingModel` records which provider/model made it so a model switch can be detected.
+  embedding: jsonb('embedding').$type<number[]>(), embeddingModel: text('embeddingModel'),
+  // `clusterId` is null for singletons. `clusteredAt` is null until the article has been through the neighbour search + LLM pass at least once.
+  clusterId: text('clusterId'), clusteredAt: timestamp('clusteredAt'), readAt: timestamp('readAt'),
+  // Set for stories extracted from a newsletter issue.
+  issueId: text('issueId'), createdAt: timestamp('createdAt').notNull().defaultNow(),
 }, (table) => ({ feedUrl: unique().on(table.feedId, table.url) }))
 
 export const cluster = pgTable('cluster', {
@@ -37,5 +54,9 @@ export const cluster = pgTable('cluster', {
 export type Feed = typeof feed.$inferSelect
 export type Article = typeof article.$inferSelect
 export type Cluster = typeof cluster.$inferSelect
+export type Issue = typeof issue.$inferSelect
+/** What the client receives: the vectors stay on the server. */
+export type ArticleView = Omit<Article, 'embedding'>
+export type ClusterView = Omit<Cluster, 'centroid'>
 
-export const schema = { user, session, account, verification, feed, article, cluster }
+export const schema = { user, session, account, verification, feed, article, cluster, issue }
