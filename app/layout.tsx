@@ -2,6 +2,9 @@ import { Analytics } from '@vercel/analytics/next'
 import type { Metadata, Viewport } from 'next'
 import './globals.css'
 
+// Server actions called from this tree (refresh + clustering) can take a few minutes on a full recluster.
+export const maxDuration = 300
+
 export const metadata: Metadata = {
   title: 'Clustered RSS Feeds · A quieter way to read the news',
   description: 'A personal, self-hosted RSS reader that groups related stories into clear news clusters.',

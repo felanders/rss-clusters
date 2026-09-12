@@ -27,7 +27,11 @@ export const feed = pgTable('feed', {
 }, (table) => ({ userUrl: unique().on(table.userId, table.url) }))
 
 export const article = pgTable('article', {
-  id: text('id').primaryKey(), feedId: text('feedId').notNull(), userId: text('userId').notNull(), title: text('title').notNull(), url: text('url').notNull(), summary: text('summary'), author: text('author'), publishedAt: timestamp('publishedAt'), guid: text('guid'), embedding: jsonb('embedding').$type<number[]>(), clusterId: text('clusterId'), readAt: timestamp('readAt'), createdAt: timestamp('createdAt').notNull().defaultNow(),
+  id: text('id').primaryKey(), feedId: text('feedId').notNull(), userId: text('userId').notNull(), title: text('title').notNull(), url: text('url').notNull(), summary: text('summary'), author: text('author'), publishedAt: timestamp('publishedAt'), guid: text('guid'),
+  // Embedding of "title + summary", produced right after retrieval. `embeddingModel` records which provider/model made it so a model switch can be detected.
+  embedding: jsonb('embedding').$type<number[]>(), embeddingModel: text('embeddingModel'),
+  // `clusterId` is null for singletons. `clusteredAt` is null until the article has been through the neighbour search + LLM pass at least once.
+  clusterId: text('clusterId'), clusteredAt: timestamp('clusteredAt'), readAt: timestamp('readAt'), createdAt: timestamp('createdAt').notNull().defaultNow(),
 }, (table) => ({ feedUrl: unique().on(table.feedId, table.url) }))
 
 export const cluster = pgTable('cluster', {
@@ -37,5 +41,8 @@ export const cluster = pgTable('cluster', {
 export type Feed = typeof feed.$inferSelect
 export type Article = typeof article.$inferSelect
 export type Cluster = typeof cluster.$inferSelect
+/** What the client receives: the vectors stay on the server. */
+export type ArticleView = Omit<Article, 'embedding'>
+export type ClusterView = Omit<Cluster, 'centroid'>
 
 export const schema = { user, session, account, verification, feed, article, cluster }
