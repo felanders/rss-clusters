@@ -1,5 +1,7 @@
 'use server'
 
+import { generateText } from 'ai'
+import { createOpenRouter } from '@openrouter/ai-sdk-provider'
 import { getToken } from '@vercel/connect'
 import { XMLParser } from 'fast-xml-parser'
 import { and, desc, eq, gt, isNotNull } from 'drizzle-orm'
@@ -37,19 +39,17 @@ const OPENROUTER_CONNECTOR_UID = process.env.OPENROUTER_CONNECTOR_UID
 if (!OPENROUTER_CONNECTOR_UID) throw new Error('OPENROUTER_CONNECTOR_UID is not configured')
 const CLUSTER_VERIFICATION_MODEL = 'google/gemini-3.5-flash-lite'
 
-async function callClusterModel<T>(prompt: string, schema: z.ZodType<T>, userId: string): Promise<T> {
-  const token = await getToken(OPENROUTER_CONNECTOR_UID!, { subject: { type: 'user', id: userId } })
-  const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'X-Title': 'Clustered RSS Feeds' },
-    body: JSON.stringify({ model: CLUSTER_VERIFICATION_MODEL, temperature: 0.1, messages: [{ role: 'user', content: prompt }], response_format: { type: 'json_object' } }),
-    signal: AbortSignal.timeout(30000),
+async function callClusterModel<T>(prompt: string, schema: z.ZodType<T>): Promise<T> {
+  const token = await getToken(OPENROUTER_CONNECTOR_UID!, { subject: { type: 'app' } })
+  const openrouter = createOpenRouter({ apiKey: token })
+  const { text: responseText } = await generateText({
+    model: openrouter(CLUSTER_VERIFICATION_MODEL),
+    prompt,
+    temperature: 0.1,
+    abortSignal: AbortSignal.timeout(30000),
   })
-  if (!response.ok) throw new Error(`Cluster model request failed (${response.status})`)
-  const payload = await response.json() as { choices?: Array<{ message?: { content?: string } }> }
-  const content = payload.choices?.[0]?.message?.content
-  if (!content) throw new Error('Cluster model returned no content')
-  return schema.parse(JSON.parse(content))
+  if (!responseText) throw new Error('Cluster model returned no content')
+  return schema.parse(JSON.parse(responseText))
 }
 
 const EMBEDDING_MODEL = 'sentence-transformers/all-minilm-l12-v2'
@@ -76,7 +76,7 @@ function updatedCentroid(oldCentroid: number[], embedding: number[], articleCoun
 }
 
 async function generateArticleEmbeddings(items: Array<{ title: string; summary: string | null }>, userId: string) {
-  const token = await getToken(OPENROUTER_CONNECTOR_UID!, { subject: { type: 'user', id: userId } })
+  const token = await getToken(OPENROUTER_CONNECTOR_UID!, { subject: { type: 'app' } })
   let response: Response | undefined
   for (let attempt = 0; attempt < 4; attempt += 1) {
     response = await fetch('https://openrouter.ai/api/v1/embeddings', {
@@ -105,14 +105,14 @@ async function generateArticleEmbeddings(items: Array<{ title: string; summary: 
 async function synthesizeCluster(clusterId: string, userId: string) {
   const rows = await db.select().from(article).where(and(eq(article.userId, userId), eq(article.clusterId, clusterId))).orderBy(desc(article.publishedAt)).limit(20)
   if (rows.length < 2) return
-  const result = await callClusterModel(`You are a neutral news editor. Combine these related headlines and summaries into one concise canonical headline (max 12 words) and 2 key takeaway bullets. Return only JSON with canonical_title and summary.\n\n${rows.map((row) => `Headline: ${row.title}\nSummary: ${row.summary ?? ''}`).join('\n\n')}`, z.object({ canonical_title: z.string(), summary: z.array(z.string()).length(2) }), userId)
+  const result = await callClusterModel(`You are a neutral news editor. Combine these related headlines and summaries into one concise canonical headline (max 12 words) and 2 key takeaway bullets. Return only JSON with canonical_title and summary.\n\n${rows.map((row) => `Headline: ${row.title}\nSummary: ${row.summary ?? ''}`).join('\n\n')}`, z.object({ canonical_title: z.string(), summary: z.array(z.string()).length(2) }))
   await db.update(cluster).set({ canonicalTitle: result.canonical_title.slice(0, 500), summary: result.summary.map((item: string) => item.slice(0, 500)), lastUpdatedAt: new Date() }).where(and(eq(cluster.id, clusterId), eq(cluster.userId, userId)))
 }
 
 async function verifyClusterMatch(item: { title: string; summary: string | null }, candidate: ClusterCandidate, score: number, userId: string) {
   const related = await db.select({ title: article.title, summary: article.summary }).from(article).where(and(eq(article.userId, userId), eq(article.clusterId, candidate.id))).orderBy(desc(article.publishedAt)).limit(5)
   if (related.length === 0) return false
-  const result = await callClusterModel(`Decide whether this incoming news article reports the same real-world story as the existing cluster. Shared topic alone is not enough; require the same event, people, place, or development. Return related=true only when grouping is editorially defensible. Return JSON with related and reason.\n\nIncoming article:\nHeadline: ${item.title}\nSummary: ${item.summary ?? ''}\n\nExisting cluster (${candidate.articleCount} articles, local similarity ${score.toFixed(3)}):\n${related.map((row) => `Headline: ${row.title}\nSummary: ${row.summary ?? ''}`).join('\n\n')}`, z.object({ related: z.boolean(), reason: z.string().max(240) }), userId)
+  const result = await callClusterModel(`Decide whether this incoming news article reports the same real-world story as the existing cluster. Shared topic alone is not enough; require the same event, people, place, or development. Return related=true only when grouping is editorially defensible. Return JSON with related and reason.\n\nIncoming article:\nHeadline: ${item.title}\nSummary: ${item.summary ?? ''}\n\nExisting cluster (${candidate.articleCount} articles, local similarity ${score.toFixed(3)}):\n${related.map((row) => `Headline: ${row.title}\nSummary: ${row.summary ?? ''}`).join('\n\n')}`, z.object({ related: z.boolean(), reason: z.string().max(240) }))
   return result.related
 }
 
@@ -260,7 +260,7 @@ export async function refreshFeed(feedId: string, scheduledUserId?: string) {
       if (inserted[0]) {
         try {
           const [embedding] = await generateArticleEmbeddings([{ title: inserted[0].title, summary: inserted[0].summary }], id)
-      await assignArticleToCluster({ ...inserted[0], userId: id }, id, embedding)
+          await assignArticleToCluster({ ...inserted[0], userId: id }, id, embedding)
         } catch (error) {
           console.error('[v0] Article embedding failed:', inserted[0].id, error)
         }
