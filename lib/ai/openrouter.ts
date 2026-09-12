@@ -1,4 +1,5 @@
 import { createOpenRouter } from '@openrouter/ai-sdk-provider'
+import { OpenRouter } from '@openrouter/sdk'
 import { getToken } from '@vercel/connect'
 
 export const CLUSTER_VERIFICATION_MODEL =
@@ -19,6 +20,12 @@ export async function openRouterProvider() {
   const connector = requireEnv(process.env.OPENROUTER_CONNECTOR_UID, 'OPENROUTER_CONNECTOR_UID')
   const apiKey = await getToken(connector, { subject: { type: 'app' } })
   return createOpenRouter({ apiKey, baseURL: OPENROUTER_API_URL })
+}
+
+export async function openRouterClient() {
+  const connector = requireEnv(process.env.OPENROUTER_CONNECTOR_UID, 'OPENROUTER_CONNECTOR_UID')
+  const apiKey = await getToken(connector, { subject: { type: 'app' } })
+  return new OpenRouter({ apiKey, serverURL: OPENROUTER_API_URL })
 }
 
 const isDevelopment = process.env.NODE_ENV !== 'production'

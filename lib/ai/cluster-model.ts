@@ -1,6 +1,11 @@
-import { generateObject } from 'ai'
+import type { ChatResult } from '@openrouter/sdk/models'
 import type { z } from 'zod'
-import { CLUSTER_VERIFICATION_MODEL, devError, devLog, openRouterProvider } from './openrouter'
+import {
+  CLUSTER_VERIFICATION_MODEL,
+  devError,
+  devLog,
+  openRouterClient,
+} from './openrouter'
 
 const CLUSTER_MODEL_TIMEOUT_MS = 30_000
 
@@ -16,18 +21,28 @@ export async function callClusterModel<T>(prompt: string, schema: z.ZodType<T>):
   })
 
   try {
-    const openrouter = await openRouterProvider()
+    const openrouter = await openRouterClient()
+    const response = await openrouter.chat.send(
+      {
+        chatRequest: {
+          model: CLUSTER_VERIFICATION_MODEL,
+          messages: [{ role: 'user', content: prompt }],
+          temperature: 0.1,
+          stream: false,
+        },
+      },
+      { timeoutMs: CLUSTER_MODEL_TIMEOUT_MS },
+    )
 
-    const { object } = await generateObject({
-      model: openrouter(CLUSTER_VERIFICATION_MODEL),
-      schema,
-      prompt,
-      temperature: 0.1,
-      abortSignal: AbortSignal.timeout(CLUSTER_MODEL_TIMEOUT_MS),
-    })
+    const result = response as ChatResult
+    const content = result.choices[0]?.message?.content
+    if (typeof content !== 'string') {
+      throw new Error('Cluster model returned no text content')
+    }
 
-    devLog('Cluster model response parsed', object)
-    return object
+    const parsed = schema.parse(JSON.parse(content))
+    devLog('Cluster model response parsed', parsed)
+    return parsed
   } catch (error) {
     devError('Cluster model request failed', error)
     throw error
