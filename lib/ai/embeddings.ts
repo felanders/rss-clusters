@@ -10,7 +10,7 @@ import {
  * provider dependency.
  */
 const EMBEDDINGS_API_URL = process.env.OPENROUTER_API_URL 
-const EMBEDDINGS_MODEL = string(process.env.OPENROUTER_EMBEDDINGS_MODEL)
+const EMBEDDINGS_MODEL = process.env.OPENROUTER_EMBEDDINGS_MODEL
 
 const EMBEDDING_TIMEOUT_MS = 60_000
 const SUMMARY_CHAR_LIMIT = 1_200
