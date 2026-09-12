@@ -19,6 +19,7 @@ const { eq, or } = await import('drizzle-orm')
 const { db, pool } = await import('../lib/db')
 const { user } = await import('../lib/db/schema')
 const { clusterPendingArticles, embedPendingArticles, reclusterAll } = await import('../lib/clustering')
+const { processPendingIssues } = await import('../lib/newsletters')
 const { syncAllFeeds } = await import('../lib/feeds')
 
 const [account] = await db.select({ id: user.id, email: user.email }).from(user).where(or(eq(user.email, target), eq(user.id, target)))
@@ -34,6 +35,8 @@ if (flags.includes('--recluster')) {
   const result = await reclusterAll(account.id, log)
   console.log(JSON.stringify({ ...result, errors: result.errors.slice(0, 5) }, null, 2))
 } else {
+  const split = await processPendingIssues(account.id, log)
+  if (split.issues) console.log(`  split ${split.issues} newsletter issue(s) into ${split.stories} stories`)
   const embedding = await embedPendingArticles(account.id, log)
   console.log(`  embedded ${embedding.embedded}/${embedding.pending}`)
   const result = await clusterPendingArticles(account.id, log)

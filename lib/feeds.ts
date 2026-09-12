@@ -1,8 +1,10 @@
 import { XMLParser } from 'fast-xml-parser'
 import { and, eq } from 'drizzle-orm'
 import { db } from '@/lib/db'
-import { article, feed } from '@/lib/db/schema'
+import { article, feed, issue } from '@/lib/db/schema'
 import { clusterPendingArticles, embedPendingArticles } from '@/lib/clustering'
+import { processPendingIssues } from '@/lib/newsletters'
+import { fetchPublic } from '@/lib/safe-fetch'
 
 function asArray<T>(value: T | T[] | undefined) { return value === undefined ? [] : Array.isArray(value) ? value : [value] }
 function text(value: unknown) {
@@ -22,7 +24,7 @@ function link(value: unknown): string {
 }
 
 async function fetchArticles(source: string) {
-  const response = await fetch(source, { headers: { accept: 'application/rss+xml, application/atom+xml, application/xml, text/xml', 'user-agent': 'ClusteredRSS/1.0 (+https://github.com/felanders/rss-clusters)' }, signal: AbortSignal.timeout(12000), cache: 'no-store' })
+  const response = await fetchPublic(source, { headers: { accept: 'application/rss+xml, application/atom+xml, application/xml, text/xml', 'user-agent': 'ClusteredRSS/1.0 (+https://github.com/felanders/rss-clusters)' }, signal: AbortSignal.timeout(12000), cache: 'no-store' })
   if (!response.ok) throw new Error(`Feed returned ${response.status}`)
   const contentLength = Number(response.headers.get('content-length') ?? 0)
   if (contentLength > 3_000_000) throw new Error('Feed is larger than 3 MB')
@@ -53,11 +55,16 @@ export async function syncFeed(feedId: string, id: string) {
   try {
     const result = await fetchArticles(current.url)
     const now = new Date()
-    const rows = result.items.slice(0, 100).map((item) => {
-      const publishedAt = item.publishedAt ? new Date(item.publishedAt) : null
-      return { id: crypto.randomUUID(), feedId: current.id, userId: id, title: item.title.slice(0, 500), url: item.url.slice(0, 2000), summary: item.summary.slice(0, 5000) || null, author: item.author.slice(0, 300) || null, publishedAt: publishedAt && !Number.isNaN(publishedAt.getTime()) ? publishedAt : null, guid: item.guid.slice(0, 1000) || null }
-    })
-    const inserted = rows.length ? await db.insert(article).values(rows).onConflictDoNothing({ target: [article.feedId, article.url] }).returning({ id: article.id }) : []
+    const parseDate = (value: string) => { const date = value ? new Date(value) : null; return date && !Number.isNaN(date.getTime()) ? date : null }
+    let inserted: Array<{ id: string }> = []
+    if (current.kind === 'newsletter') {
+      // Each entry is an email; keep the full body as an issue and let processPendingIssues split it into stories.
+      const rows = result.items.slice(0, 50).map((item) => ({ id: crypto.randomUUID(), feedId: current.id, userId: id, title: item.title.slice(0, 500), url: item.url.slice(0, 2000), content: item.summary, publishedAt: parseDate(item.publishedAt) }))
+      inserted = rows.length ? await db.insert(issue).values(rows).onConflictDoNothing({ target: [issue.feedId, issue.url] }).returning({ id: issue.id }) : []
+    } else {
+      const rows = result.items.slice(0, 100).map((item) => ({ id: crypto.randomUUID(), feedId: current.id, userId: id, title: item.title.slice(0, 500), url: item.url.slice(0, 2000), summary: item.summary.slice(0, 5000) || null, author: item.author.slice(0, 300) || null, publishedAt: parseDate(item.publishedAt), guid: item.guid.slice(0, 1000) || null }))
+      inserted = rows.length ? await db.insert(article).values(rows).onConflictDoNothing({ target: [article.feedId, article.url] }).returning({ id: article.id }) : []
+    }
     const defaultName = new URL(current.url).hostname.replace(/^www\./, '')
     const nextName = current.name === defaultName ? result.title.slice(0, 200) : current.name
     await db.update(feed).set({ name: nextName, status: 'Healthy', lastSyncedAt: now, lastError: null, updatedAt: now }).where(and(eq(feed.id, feedId), eq(feed.userId, id)))
@@ -80,6 +87,10 @@ export async function syncAllFeeds(id: string, options: { cluster?: boolean } = 
   const added = results.reduce((sum, result) => sum + (result.status === 'fulfilled' ? result.value.added : 0), 0)
   log.push(`Fetched ${results.length - errors.length} of ${rows.length} feeds, ${added} new article${added === 1 ? '' : 's'}.`)
   errors.forEach((message) => log.push(`Feed error — ${message}`))
+  if (rows.some((item) => item.kind === 'newsletter')) {
+    const split = await processPendingIssues(id, (message) => log.push(message))
+    errors.push(...split.errors)
+  }
   if (options.cluster ?? true) {
     const embedding = await embedPendingArticles(id, (message) => log.push(message))
     errors.push(...embedding.errors)

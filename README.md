@@ -11,6 +11,10 @@ A personal RSS reader that groups articles from all your feeds into the stories 
 
 Only LLM-confirmed groups of two or more articles become clusters. Later arrivals can still join an existing cluster (its headline/summary is refreshed).
 
+## Newsletters
+
+Email newsletters can be read as feeds too. Get a feed address for the newsletter from [Kill the Newsletter](https://kill-the-newsletter.com) (it gives you an email address to subscribe with and a matching Atom feed URL), then add that URL in ⚙ settings with **Newsletter** ticked (it is ticked automatically for kill-the-newsletter.com URLs). Every issue is stored as an `issue` and an LLM splits it into its individual stories (`lib/newsletters.ts`) — neutral headline, short summary, the story's own link when the email has one — which then go through embedding and clustering like any other article, so a newsletter item about a story you already have from RSS ends up in the same cluster.
+
 ## Setup
 
 ```bash
@@ -20,7 +24,7 @@ pnpm db:migrate              # creates / updates the app tables (idempotent)
 pnpm dev
 ```
 
-Sign up, add feeds in ⚙ settings, then press ↻ (fetch feeds → embed → cluster new articles). **Recluster** rebuilds every cluster from scratch.
+Put your email in `SIGNUP_ALLOWED_EMAILS` (sign-up is invitation-only; with the variable empty nobody can register), sign up, add feeds in ⚙ settings, then press ↻ (fetch feeds → embed → cluster new articles). **Recluster** rebuilds every cluster from scratch.
 
 ### Command line
 

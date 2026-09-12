@@ -3,14 +3,34 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import DOMPurify from 'isomorphic-dompurify'
 import { useRouter } from 'next/navigation'
-import { ChevronDown, ChevronRight, Circle, ExternalLink, Layers, LogOut, Pencil, Plus, RefreshCw, Settings2, Trash2, X } from 'lucide-react'
+import { ChevronDown, ChevronRight, Circle, ExternalLink, Layers, LogOut, Mail, Pencil, Plus, RefreshCw, Settings2, Trash2, X } from 'lucide-react'
 import { addFeed, deleteFeed, listArticles, listClusters, listFeeds, listReadArticleIds, markArticleRead, reclusterArticles, refreshAllFeeds, updateFeed } from '@/app/actions/feeds'
 import { signOut, useSession } from '@/lib/auth-client'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import type { ArticleView, ClusterView, Feed } from '@/lib/db/schema'
+import type { ArticleView, ClusterView, Feed, FeedKind } from '@/lib/db/schema'
 
 type Group = { key: string; cluster: ClusterView | null; articles: ArticleView[]; latest: number }
+/** new: nothing read yet · updated: a story you already read gained new articles · read: everything seen. */
+type ReadState = 'new' | 'updated' | 'read'
+
+function readState(group: Group, read: Set<string>): ReadState {
+  const unread = group.articles.filter((item) => !read.has(item.id)).length
+  return unread === 0 ? 'read' : unread === group.articles.length ? 'new' : 'updated'
+}
+
+/** List sections, top to bottom: new clusters · new single articles · stories you follow that gained articles · everything read. */
+const SECTIONS = [
+  { key: 'new-clusters', label: null, matches: (group: Group, state: ReadState) => state === 'new' && Boolean(group.cluster) },
+  { key: 'new-articles', label: 'New articles', matches: (group: Group, state: ReadState) => state === 'new' && !group.cluster },
+  { key: 'updated', label: 'Updated stories', matches: (_group: Group, state: ReadState) => state === 'updated' },
+  { key: 'read', label: 'Already read', matches: (_group: Group, state: ReadState) => state === 'read' },
+] as const
+const READ_SECTION = SECTIONS.length - 1
+function sectionIndex(group: Group, read: Set<string>) {
+  const state = readState(group, read)
+  return SECTIONS.findIndex((section) => section.matches(group, state))
+}
 
 export default function Page() {
   const router = useRouter()
@@ -25,12 +45,14 @@ export default function Page() {
   // When the unread filter is on, only articles read *before* it was switched on are hidden — otherwise rows would vanish
   // under the reader's finger as scrolling marks them read.
   const [hiddenRead, setHiddenRead] = useState<Set<string> | null>(null)
+  // Read state as of the last load — used for ordering so rows don't jump around while scrolling marks them read.
+  const [readAtLoad, setReadAtLoad] = useState<Set<string>>(new Set())
   const [selectedCategory, setSelectedCategory] = useState('All')
   const [log, setLog] = useState<string[]>([])
 
   const reload = useCallback(async () => {
     const [nextFeeds, nextArticles, nextClusters, readIds] = await Promise.all([listFeeds(), listArticles(), listClusters(), listReadArticleIds()])
-    setFeeds(nextFeeds); setArticles(nextArticles); setClusters(nextClusters); setViewed(new Set(readIds))
+    setFeeds(nextFeeds); setArticles(nextArticles); setClusters(nextClusters); setViewed(new Set(readIds)); setReadAtLoad(new Set(readIds))
     setHiddenRead((current) => current ? new Set(readIds) : null)
   }, [])
 
@@ -98,8 +120,16 @@ export default function Page() {
       result.push({ key: clusterId, cluster: clusterById.get(clusterId)!, articles: members, latest: time(members[0]) })
     }
     for (const item of singles) result.push({ key: item.id, cluster: null, articles: [item], latest: time(item) })
-    return result.sort((left, right) => right.latest - left.latest)
-  }, [articles, clusters, feedById, selectedCategory, hiddenRead])
+    // Sections as in SECTIONS; unread sections list bigger clusters first, the read section is purely chronological so
+    // clusters you have finished with blend in with the other stories.
+    const rank = (group: Group) => sectionIndex(group, readAtLoad)
+    const size = (group: Group) => group.cluster ? group.articles.length : 0
+    return result.sort((left, right) => {
+      const section = rank(left) - rank(right)
+      if (section !== 0) return section
+      return (rank(left) === READ_SECTION ? 0 : size(right) - size(left)) || right.latest - left.latest
+    })
+  }, [articles, clusters, feedById, selectedCategory, hiddenRead, readAtLoad])
 
   if (isPending) return <main className="flex min-h-screen items-center justify-center bg-white text-sm text-neutral-500">Loading…</main>
   if (!session) {
@@ -152,7 +182,7 @@ export default function Page() {
         {loading ? <div className="border-y border-neutral-200 py-8 text-sm text-neutral-500">Loading your inbox…</div>
           : articles.length === 0 ? <div className="border-y border-neutral-200 py-16 text-center text-sm text-neutral-500">Your inbox is empty. Add a feed from settings, then refresh.</div>
           : groups.length === 0 ? <div className="border-y border-neutral-200 py-16 text-center text-sm text-neutral-500">Nothing matches the current filters.</div>
-          : <ReaderTable groups={groups} feedById={feedById} viewed={viewed} onViewed={markViewed} />}
+          : <ReaderTable groups={groups} feedById={feedById} viewed={viewed} readAtLoad={readAtLoad} onViewed={markViewed} />}
       </main>
 
       {settingsOpen && (
@@ -174,19 +204,60 @@ const formatShortDate = (value: Date | string | null) => value ? new Intl.DateTi
 
 /** Fallback sticky-header height; the real one is measured so rows hidden beneath it count as scrolled past. */
 const HEADER_OFFSET = 56
+/** Below this width (Tailwind `sm`) the reader is touch-first: scrolling past a headline marks it read. Above it, keyboard navigation does. */
+const MOBILE_QUERY = '(max-width: 639px)'
+const DEFAULT_COLUMNS = { source: 170, date: 140 }
+const COLUMNS_KEY = 'reader.columns'
 
-function ReaderTable({ groups, feedById, viewed, onViewed }: { groups: Group[]; feedById: Map<string, Feed>; viewed: Set<string>; onViewed: (ids: string[]) => void }) {
+function ResizeHandle({ label, onPointerDown }: { label: string; onPointerDown: (event: React.PointerEvent<HTMLElement>) => void }) {
+  return <span role="separator" aria-label={label} onPointerDown={onPointerDown} className="absolute inset-y-[-8px] right-[-10px] flex w-4 cursor-col-resize items-center justify-center touch-none"><span className="h-full w-px bg-neutral-200 transition-colors hover:bg-neutral-500" /></span>
+}
+
+function useMediaQuery(query: string) {
+  const [matches, setMatches] = useState(false)
+  useEffect(() => {
+    const media = window.matchMedia(query)
+    const update = () => setMatches(media.matches)
+    update()
+    media.addEventListener('change', update)
+    return () => media.removeEventListener('change', update)
+  }, [query])
+  return matches
+}
+
+function ReaderTable({ groups, feedById, viewed, readAtLoad, onViewed }: { groups: Group[]; feedById: Map<string, Feed>; viewed: Set<string>; readAtLoad: Set<string>; onViewed: (ids: string[]) => void }) {
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
+  const [selected, setSelected] = useState<number | null>(null)
+  const isMobile = useMediaQuery(MOBILE_QUERY)
   const rowRefs = useRef<Array<HTMLButtonElement | null>>([])
   const idsByRow = useRef(new WeakMap<Element, string[]>())
   const observerRef = useRef<IntersectionObserver | null>(null)
   const onViewedRef = useRef(onViewed)
   onViewedRef.current = onViewed
-  const gridTemplate = '28px minmax(0, 1fr) 170px 140px 36px'
+  // Desktop columns: chevron · sources · story (flexible) · date · read. Sources/date widths are draggable and remembered per browser.
+  const [columns, setColumns] = useState(DEFAULT_COLUMNS)
+  useEffect(() => {
+    try { const saved = localStorage.getItem(COLUMNS_KEY); if (saved) setColumns({ ...DEFAULT_COLUMNS, ...JSON.parse(saved) }) } catch {}
+  }, [])
+  const resizeColumn = (column: keyof typeof DEFAULT_COLUMNS, event: React.PointerEvent<HTMLElement>) => {
+    event.preventDefault(); event.stopPropagation()
+    const startX = event.clientX
+    const startWidth = columns[column]
+    let next = { ...columns }
+    const onMove = (moveEvent: PointerEvent) => {
+      next = { ...next, [column]: Math.max(70, Math.min(480, startWidth + moveEvent.clientX - startX)) }
+      setColumns(next)
+      try { localStorage.setItem(COLUMNS_KEY, JSON.stringify(next)) } catch {}
+    }
+    const onUp = () => { window.removeEventListener('pointermove', onMove); window.removeEventListener('pointerup', onUp); window.removeEventListener('pointercancel', onUp) }
+    window.addEventListener('pointermove', onMove); window.addEventListener('pointerup', onUp); window.addEventListener('pointercancel', onUp)
+  }
+  const gridTemplate = `28px ${columns.source}px minmax(0, 1fr) ${columns.date}px 36px`
   const feedName = (id: string) => feedById.get(id)?.name ?? 'Unknown source'
 
-  // A headline that has scrolled up past the header counts as read.
+  // Touch: a headline that has scrolled up past the header counts as read.
   useEffect(() => {
+    if (!isMobile) return
     const headerHeight = document.querySelector('header')?.offsetHeight ?? HEADER_OFFSET
     const observer = new IntersectionObserver((entries) => {
       const passed = entries.filter((entry) => !entry.isIntersecting && entry.boundingClientRect.bottom <= (entry.rootBounds?.top ?? headerHeight)).flatMap((entry) => idsByRow.current.get(entry.target) ?? [])
@@ -195,7 +266,7 @@ function ReaderTable({ groups, feedById, viewed, onViewed }: { groups: Group[]; 
     observerRef.current = observer
     rowRefs.current.forEach((element) => { if (element) observer.observe(element) })
     return () => { observer.disconnect(); observerRef.current = null }
-  }, [])
+  }, [isMobile])
 
   const attachRow = (index: number, group: Group) => (element: HTMLButtonElement | null) => {
     const previous = rowRefs.current[index]
@@ -207,52 +278,98 @@ function ReaderTable({ groups, feedById, viewed, onViewed }: { groups: Group[]; 
     }
   }
 
+  // Opening a single article marks it read; a cluster is marked read when it is closed again (or navigated past), so the
+  // "new" tags on freshly added articles stay visible while it is open.
   const toggle = (key: string) => setExpanded((current) => { const next = new Set(current); if (next.has(key)) next.delete(key); else next.add(key); return next })
 
-  const moveFocus = (index: number, delta: number) => {
-    const next = Math.max(0, Math.min(groups.length - 1, index + delta))
-    rowRefs.current[next]?.focus()
-    rowRefs.current[next]?.scrollIntoView({ block: 'center', behavior: 'smooth' })
-  }
+  // Keyboard: ↑/↓ (or j/k) move the selection, Space/Enter opens or closes the selected story, and leaving a row marks it read.
+  useEffect(() => {
+    if (isMobile) return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.metaKey || event.ctrlKey || event.altKey) return
+      const target = event.target as HTMLElement | null
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) return
+      if (document.querySelector('[role="dialog"]')) return
+      const delta = event.key === 'ArrowDown' || event.key === 'j' ? 1 : event.key === 'ArrowUp' || event.key === 'k' ? -1 : 0
+      if (delta !== 0) {
+        event.preventDefault()
+        if (groups.length === 0) return
+        if (selected === null) { setSelected(delta > 0 ? 0 : groups.length - 1); return }
+        const next = Math.max(0, Math.min(groups.length - 1, selected + delta))
+        if (next !== selected) { onViewed(groups[selected].articles.map((item) => item.id)); setSelected(next) }
+      } else if ((event.key === ' ' || event.key === 'Enter') && selected !== null && groups[selected]) {
+        event.preventDefault()
+        const group = groups[selected]
+        if (expanded.has(group.key) || !group.cluster) onViewed(group.articles.map((item) => item.id))
+        toggle(group.key)
+      } else if (event.key === 'Escape' && selected !== null) {
+        setSelected(null)
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [isMobile, groups, selected, expanded, onViewed])
+
+  // Keep the selection valid and visible (below the sticky header) as it moves.
+  useEffect(() => {
+    if (selected === null) return
+    if (selected >= groups.length) { setSelected(groups.length ? groups.length - 1 : null); return }
+    const element = rowRefs.current[selected]
+    if (!element) return
+    const headerHeight = document.querySelector('header')?.offsetHeight ?? HEADER_OFFSET
+    const rect = element.getBoundingClientRect()
+    if (rect.top < headerHeight + 8) window.scrollBy({ top: rect.top - headerHeight - 8, behavior: 'smooth' })
+    else if (rect.bottom > window.innerHeight - 8) window.scrollBy({ top: rect.bottom - window.innerHeight + 8, behavior: 'smooth' })
+  }, [selected, groups.length])
 
   return (
     <div className="border-y border-neutral-200">
       <div className="hidden items-center gap-2 border-b border-neutral-200 px-3 py-2 text-[10px] font-medium uppercase tracking-[0.16em] text-neutral-400 sm:grid" style={{ gridTemplateColumns: gridTemplate }}>
-        <span /><span>Story</span><span>Sources</span><span>Latest</span><span>Read</span>
+        <span />
+        <span className="relative">Sources<ResizeHandle label="Resize sources column" onPointerDown={(event) => resizeColumn('source', event)} /></span>
+        <span className="truncate">Story <span className="ml-2 normal-case tracking-normal text-neutral-300">↑↓ select · space open</span></span>
+        <span className="relative">Latest<ResizeHandle label="Resize date column" onPointerDown={(event) => resizeColumn('date', event)} /></span>
+        <span>Read</span>
       </div>
       {groups.map((group, index) => {
         const isOpen = expanded.has(group.key)
         const ids = group.articles.map((item) => item.id)
-        const unread = ids.some((id) => !viewed.has(id))
+        const state = readState(group, viewed)
+        const unread = state !== 'read'
+        const newCount = ids.filter((id) => !viewed.has(id)).length
+        const section = sectionIndex(group, readAtLoad)
+        const sectionLabel = index > 0 && sectionIndex(groups[index - 1], readAtLoad) !== section ? SECTIONS[section].label : null
         const sources = [...new Set(group.articles.map((item) => feedName(item.feedId)))]
         const heading = group.cluster ? group.cluster.canonicalTitle : decodeEntities(group.articles[0].title)
         return (
-          <div key={group.key} className={`border-b border-neutral-100 last:border-0 ${group.cluster ? 'sm:bg-neutral-50/50' : ''}`}>
+          <div key={group.key} className={`border-b border-neutral-100 last:border-0 ${group.cluster && section !== READ_SECTION ? 'sm:bg-neutral-50/50' : ''} ${selected === index ? 'sm:bg-neutral-100 sm:shadow-[inset_3px_0_0_0_black]' : ''}`}>
+            {sectionLabel && <p className="border-b border-neutral-200 bg-neutral-50 px-2 py-1.5 text-[10px] font-medium uppercase tracking-[0.16em] text-neutral-400 sm:px-3">{sectionLabel}</p>}
             <button
               ref={attachRow(index, group)}
               type="button"
               aria-expanded={isOpen}
               className="flex w-full items-start gap-2 px-1 py-3 text-left transition-colors hover:bg-neutral-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-black sm:grid sm:items-center sm:px-3 sm:py-2.5"
               style={{ gridTemplateColumns: gridTemplate }}
-              onClick={() => { toggle(group.key); if (!isOpen) onViewed(ids) }}
-              onKeyDown={(event) => {
-                if (event.key === 'ArrowDown' || event.key === 'ArrowUp') { event.preventDefault(); moveFocus(index, event.key === 'ArrowDown' ? 1 : -1) }
-              }}
+              onClick={(event) => { event.currentTarget.blur(); setSelected(index); toggle(group.key); if (isOpen || !group.cluster) onViewed(ids) }}
             >
               <span className="hidden text-neutral-400 sm:block">{isOpen ? <ChevronDown className="size-4" /> : <ChevronRight className="size-4" />}</span>
-              <span className="flex min-w-0 flex-1 items-start gap-2 sm:flex-none sm:items-center">
-                <span className={`min-w-0 text-[15px] leading-snug sm:truncate sm:text-sm ${unread ? 'font-semibold text-neutral-950' : 'font-normal text-neutral-500'}`}>{heading}</span>
-                {group.cluster && <span className={`mt-0.5 shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold sm:mt-0 ${unread ? 'bg-black text-white' : 'bg-neutral-200 text-neutral-600'}`}>{group.articles.length}</span>}
-              </span>
               <span className="hidden truncate text-xs text-neutral-500 sm:block">{sources.length > 2 ? `${sources.slice(0, 2).join(', ')} +${sources.length - 2}` : sources.join(', ')}</span>
+              <span className="flex min-w-0 flex-1 items-start gap-2 sm:flex-none sm:items-center">
+                <span className={`min-w-0 text-[15px] leading-snug sm:truncate sm:text-sm ${state === 'new' ? 'font-semibold text-neutral-950' : state === 'updated' ? 'font-medium text-neutral-800' : 'font-normal text-neutral-500'}`}>{heading}</span>
+                {group.cluster && state === 'updated'
+                  ? <span className="mt-0.5 shrink-0 rounded-full border border-black bg-white px-2 py-0.5 text-[10px] font-semibold text-black sm:mt-0" title={`${newCount} new of ${group.articles.length} articles`}>+{newCount} new · {group.articles.length}</span>
+                  : group.cluster && <span className={`mt-0.5 shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold sm:mt-0 ${unread ? 'bg-black text-white' : 'bg-neutral-200 text-neutral-600'}`}>{group.articles.length}</span>}
+              </span>
               <span className="hidden truncate text-xs text-neutral-500 sm:block" suppressHydrationWarning>{formatDate(group.articles[0].publishedAt ?? group.articles[0].createdAt)}</span>
               <span className="hidden justify-center sm:flex" role="button" tabIndex={-1} aria-label={unread ? 'Mark as read' : 'Read'} onClick={(event) => { event.stopPropagation(); onViewed(ids) }}>
-                <Circle className={`size-2.5 ${unread ? 'fill-black text-black' : 'text-neutral-300'}`} />
+                {state === 'updated'
+                  ? <span aria-hidden className="size-2.5 rounded-full border-[1.5px] border-black [background:linear-gradient(90deg,black_50%,white_50%)]" />
+                  : <Circle className={`size-2.5 ${unread ? 'fill-black text-black' : 'text-neutral-300'}`} />}
               </span>
             </button>
             {isOpen && (
               <div className="ml-1 border-l border-neutral-200 pb-3 pl-3 sm:ml-[40px] sm:pl-5">
-                {group.cluster ? <ClusterBody group={group} feedName={feedName} viewed={viewed} onViewed={onViewed} /> : <ArticleBody article={group.articles[0]} feedName={feedName} onViewed={onViewed} />}
+                {group.cluster ? <ClusterBody group={group} feedName={feedName} viewed={viewed} onViewed={onViewed} columns={columns} /> : <ArticleBody article={group.articles[0]} feedName={feedName} onViewed={onViewed} />}
               </div>
             )}
           </div>
@@ -263,7 +380,9 @@ function ReaderTable({ groups, feedById, viewed, onViewed }: { groups: Group[]; 
 }
 
 /** Expanded cluster: the neutral summary, then one expandable row per source article. */
-function ClusterBody({ group, feedName, viewed, onViewed }: { group: Group; feedName: (id: string) => string; viewed: Set<string>; onViewed: (ids: string[]) => void }) {
+function ClusterBody({ group, feedName, viewed, onViewed, columns }: { group: Group; feedName: (id: string) => string; viewed: Set<string>; onViewed: (ids: string[]) => void; columns: typeof DEFAULT_COLUMNS }) {
+  // The body sits 60px further right than the top-level rows; keep the source column roughly aligned with the header.
+  const innerGrid = `20px ${Math.max(80, columns.source - 52)}px minmax(0, 1fr) ${columns.date}px`
   const [openArticles, setOpenArticles] = useState<Set<string>>(new Set())
   const toggle = (id: string) => setOpenArticles((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next })
   const summary = group.cluster?.summary ?? []
@@ -281,13 +400,13 @@ function ClusterBody({ group, feedName, viewed, onViewed }: { group: Group; feed
           const unread = !viewed.has(item.id)
           return (
             <div key={item.id}>
-              <button type="button" aria-expanded={isOpen} onClick={() => { toggle(item.id); if (!isOpen) onViewed([item.id]) }} className="flex w-full items-start gap-2 py-2 text-left hover:bg-neutral-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-black sm:grid sm:items-center" style={{ gridTemplateColumns: '20px minmax(0, 1fr) 160px 150px' }}>
+              <button type="button" aria-expanded={isOpen} onClick={() => { toggle(item.id); if (!isOpen) onViewed([item.id]) }} className="flex w-full items-start gap-2 py-2 text-left hover:bg-neutral-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-black sm:grid sm:items-center" style={{ gridTemplateColumns: innerGrid }}>
                 <span className="mt-0.5 text-neutral-400 sm:mt-0">{isOpen ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}</span>
+                <span className="hidden truncate text-xs text-neutral-500 sm:block">{feedName(item.feedId)}</span>
                 <span className="min-w-0 flex-1 sm:flex-none">
-                  <span className={`block text-sm leading-snug sm:truncate ${unread ? 'font-medium text-neutral-900' : 'text-neutral-500'}`}>{decodeEntities(item.title)}</span>
+                  <span className={`block text-sm leading-snug sm:truncate ${unread ? 'font-medium text-neutral-900' : 'text-neutral-500'}`}>{unread && <span className="mr-1.5 inline-block -translate-y-px rounded-full bg-black px-1.5 py-px align-middle text-[9px] font-semibold uppercase tracking-wide text-white">new</span>}{decodeEntities(item.title)}</span>
                   <span className="mt-0.5 block text-[11px] text-neutral-400 sm:hidden" suppressHydrationWarning>{feedName(item.feedId)} · {formatShortDate(item.publishedAt ?? item.createdAt)}</span>
                 </span>
-                <span className="hidden truncate text-xs text-neutral-500 sm:block">{feedName(item.feedId)}</span>
                 <span className="hidden truncate text-xs text-neutral-500 sm:block" suppressHydrationWarning>{formatDate(item.publishedAt ?? item.createdAt)}</span>
               </button>
               {isOpen && <div className="ml-2 border-l border-neutral-200 pb-2 pl-3 sm:ml-5 sm:pl-4"><ArticleBody article={item} feedName={feedName} onViewed={onViewed} /></div>}
@@ -302,13 +421,17 @@ function ClusterBody({ group, feedName, viewed, onViewed }: { group: Group; feed
 /** Expanded article: its own summary plus a link to the source. */
 function ArticleBody({ article, feedName, onViewed }: { article: ArticleView; feedName: (id: string) => string; onViewed: (ids: string[]) => void }) {
   const summary = sanitizeSummary(article.summary ?? '')
+  // Newsletter stories without their own link point at the issue email (url + "#story-n").
+  const fromNewsletter = Boolean(article.issueId)
+  const linksToIssue = fromNewsletter && /#story-\d+/.test(article.url)
   return (
     <div className="py-2">
       {summary ? <div className="break-words text-sm leading-6 text-neutral-600 [&_a]:underline [&_p]:mb-2" dangerouslySetInnerHTML={{ __html: summary }} /> : <p className="text-sm italic text-neutral-400">No summary in the feed.</p>}
       <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-neutral-500">
-        <span>{feedName(article.feedId)}</span>
-        {article.author && <span>· {decodeEntities(article.author)}</span>}
-        <a href={article.url} target="_blank" rel="noreferrer" onClick={() => onViewed([article.id])} className="inline-flex items-center gap-1 font-medium text-neutral-950 hover:underline">Open article<ExternalLink className="size-3" /></a>
+        <span className="inline-flex items-center gap-1">{fromNewsletter && <Mail className="size-3" />}{feedName(article.feedId)}</span>
+        {article.author && article.author !== feedName(article.feedId) && <span>· {decodeEntities(article.author)}</span>}
+        {fromNewsletter && <span className="text-neutral-400">summary by AI from the newsletter</span>}
+        <a href={article.url} target="_blank" rel="noreferrer" onClick={() => onViewed([article.id])} className="inline-flex items-center gap-1 font-medium text-neutral-950 hover:underline">{linksToIssue ? 'Open newsletter issue' : 'Open article'}<ExternalLink className="size-3" /></a>
       </div>
     </div>
   )
@@ -316,6 +439,9 @@ function ArticleBody({ article, feedName, onViewed }: { article: ArticleView; fe
 
 function FeedSettings({ feeds, busy, onAdded, onClose, onRecluster, onSignOut }: { feeds: Feed[]; busy: boolean; onAdded: (feed: Feed) => void; onClose: () => void; onRecluster: () => void; onSignOut: () => void }) {
   const [url, setUrl] = useState('')
+  const [kind, setKind] = useState<FeedKind>('rss')
+  const [kindTouched, setKindTouched] = useState(false)
+  const [draftKind, setDraftKind] = useState<FeedKind>('rss')
   const [error, setError] = useState('')
   const [saving, setSaving] = useState(false)
   const [editing, setEditing] = useState<string | null>(null)
@@ -324,15 +450,15 @@ function FeedSettings({ feeds, busy, onAdded, onClose, onRecluster, onSignOut }:
 
   async function submit(event: React.FormEvent) {
     event.preventDefault(); setSaving(true); setError('')
-    try { const nextFeed = await addFeed(url); onAdded(nextFeed); setUrl('') }
+    try { const nextFeed = await addFeed(url, kind); onAdded(nextFeed); setUrl(''); setKind('rss'); setKindTouched(false) }
     catch (error) { setError(error instanceof Error ? error.message : 'Unable to add feed.') }
     finally { setSaving(false) }
   }
 
-  function startEditing(item: Feed) { setEditing(item.id); setDraftName(item.name); setDraftCategory(item.category); setError('') }
+  function startEditing(item: Feed) { setEditing(item.id); setDraftName(item.name); setDraftCategory(item.category); setDraftKind(item.kind); setError('') }
   async function saveEdit(item: Feed) {
     setSaving(true); setError('')
-    try { await updateFeed(item.id, { name: draftName, category: draftCategory }); item.name = draftName.trim() || item.name; item.category = draftCategory.trim() || item.category; setEditing(null) }
+    try { await updateFeed(item.id, { name: draftName, category: draftCategory, kind: draftKind }); item.name = draftName.trim() || item.name; item.category = draftCategory.trim() || item.category; item.kind = draftKind; setEditing(null) }
     catch (error) { setError(error instanceof Error ? error.message : 'Unable to update feed.') }
     finally { setSaving(false) }
   }
@@ -351,9 +477,15 @@ function FeedSettings({ feeds, busy, onAdded, onClose, onRecluster, onSignOut }:
           <div><p className="text-xs font-medium uppercase tracking-[0.16em] text-neutral-400">Settings</p><h2 className="mt-1 text-2xl font-semibold tracking-[-0.04em]">Feeds</h2></div>
           <Button variant="ghost" size="icon" aria-label="Close settings" onClick={onClose}><X /></Button>
         </div>
-        <form onSubmit={submit} className="flex gap-2 px-5 pt-6 sm:px-8 sm:pt-8">
-          <Input value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://example.com/feed.xml" aria-label="RSS feed URL" inputMode="url" autoCapitalize="none" />
-          <Button type="submit" disabled={saving} className="shrink-0 bg-black text-white hover:bg-neutral-800"><Plus />{saving ? 'Adding…' : 'Add'}</Button>
+        <form onSubmit={submit} className="px-5 pt-6 sm:px-8 sm:pt-8">
+          <div className="flex gap-2">
+            <Input value={url} onChange={(event) => { setUrl(event.target.value); if (!kindTouched) setKind(/kill-the-newsletter\.com/i.test(event.target.value) ? 'newsletter' : 'rss') }} placeholder="https://example.com/feed.xml" aria-label="Feed URL" inputMode="url" autoCapitalize="none" />
+            <Button type="submit" disabled={saving} className="shrink-0 bg-black text-white hover:bg-neutral-800"><Plus />{saving ? 'Adding…' : 'Add'}</Button>
+          </div>
+          <label className="mt-2.5 flex cursor-pointer items-start gap-2 text-xs text-neutral-500">
+            <input type="checkbox" className="mt-0.5 accent-black" checked={kind === 'newsletter'} onChange={(event) => { setKind(event.target.checked ? 'newsletter' : 'rss'); setKindTouched(true) }} />
+            <span><span className="font-medium text-neutral-800">Newsletter</span> — each entry is an email (e.g. a <a href="https://kill-the-newsletter.com" target="_blank" rel="noreferrer" className="underline">Kill the Newsletter</a> feed); an LLM splits every issue into its stories.</span>
+          </label>
         </form>
         {error && <p role="alert" className="px-5 pt-3 text-xs text-red-600 sm:px-8">{error}</p>}
         <div className="mx-5 mt-6 min-h-0 flex-1 divide-y divide-neutral-100 overflow-y-auto overscroll-contain border-y border-neutral-200 sm:mx-8">
@@ -364,12 +496,13 @@ function FeedSettings({ feeds, busy, onAdded, onClose, onRecluster, onSignOut }:
                 <div className="flex flex-col gap-2">
                   <Input value={draftName} onChange={(event) => setDraftName(event.target.value)} aria-label="Feed name" />
                   <Input value={draftCategory} onChange={(event) => setDraftCategory(event.target.value)} aria-label="Feed category" placeholder="Category" />
+                  <label className="flex cursor-pointer items-center gap-2 text-xs text-neutral-600"><input type="checkbox" className="accent-black" checked={draftKind === 'newsletter'} onChange={(event) => setDraftKind(event.target.checked ? 'newsletter' : 'rss')} />Newsletter — split each issue into stories</label>
                   <div className="flex justify-end gap-2"><Button type="button" variant="ghost" size="sm" onClick={() => setEditing(null)}>Cancel</Button><Button type="button" size="sm" disabled={saving} onClick={() => saveEdit(item)} className="bg-black text-white hover:bg-neutral-800">Save</Button></div>
                 </div>
               ) : (
                 <div className="flex items-center justify-between gap-3">
                   <div className="min-w-0 flex-1">
-                    <div className="truncate text-sm">{item.name}</div>
+                    <div className="flex min-w-0 items-center gap-1.5 text-sm"><span className="truncate">{item.name}</span>{item.kind === 'newsletter' && <span className="inline-flex shrink-0 items-center gap-1 rounded-full border border-neutral-300 px-1.5 py-px text-[10px] font-medium text-neutral-600"><Mail className="size-2.5" />Newsletter</span>}</div>
                     <div className="mt-0.5 truncate text-xs text-neutral-400">{item.category} · <span className={item.status === 'Error' ? 'text-red-600' : ''}>{item.status}</span>{item.lastError ? ` · ${item.lastError}` : ''}</div>
                   </div>
                   <div className="flex shrink-0 items-center gap-0.5"><Button variant="ghost" size="icon" aria-label={`Edit ${item.name}`} onClick={() => startEditing(item)}><Pencil /></Button><Button variant="ghost" size="icon" aria-label={`Delete ${item.name}`} onClick={() => remove(item)} disabled={saving}><Trash2 /></Button></div>
