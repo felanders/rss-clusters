@@ -37,7 +37,9 @@ function link(value: unknown) {
 
 const OPENROUTER_CONNECTOR_UID = process.env.OPENROUTER_CONNECTOR_UID
 if (!OPENROUTER_CONNECTOR_UID) throw new Error('OPENROUTER_CONNECTOR_UID is not configured')
-const CLUSTER_VERIFICATION_MODEL = 'google/gemini-3.5-flash-lite'
+const CLUSTER_VERIFICATION_MODEL = process.env.OPENROUTER_CLUSTER_VERIFICATION_MODEL ?? 'google/gemini-3.5-flash-lite'
+const OPENROUTER_API_URL = process.env.OPENROUTER_API_URL ?? 'https://openrouter.ai/api/v1'
+const OPENROUTER_APP_TITLE = process.env.OPENROUTER_APP_TITLE ?? 'Clustered RSS Feeds'
 const isDevelopment = process.env.NODE_ENV !== 'production'
 
 function devLog(message: string, details?: unknown) {
@@ -70,8 +72,8 @@ async function callClusterModel<T>(prompt: string, schema: z.ZodType<T>): Promis
   }
 }
 
-const EMBEDDING_MODEL = 'sentence-transformers/all-minilm-l12-v2'
-const LOCAL_CLUSTER_THRESHOLD = 0.55
+const EMBEDDING_MODEL = process.env.OPENROUTER_EMBEDDING_MODEL ?? 'sentence-transformers/all-minilm-l12-v2'
+const LOCAL_CLUSTER_THRESHOLD = Number(process.env.LOCAL_CLUSTER_THRESHOLD ?? '0.55')
 
 type ClusterCandidate = { id: string; centroid: number[]; canonicalTitle: string; articleCount: number }
 
@@ -100,9 +102,9 @@ async function generateArticleEmbeddings(items: Array<{ title: string; summary: 
     let response: Response | undefined
     for (let attempt = 0; attempt < 4; attempt += 1) {
       devLog('Embedding attempt started', { attempt: attempt + 1, articleCount: items.length })
-      response = await fetch('https://openrouter.ai/api/v1/embeddings', {
+      response = await fetch(`${OPENROUTER_API_URL.replace(/\/$/, '')}/embeddings`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'X-Title': 'Clustered RSS Feeds' },
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'X-Title': OPENROUTER_APP_TITLE },
         body: JSON.stringify({ model: EMBEDDING_MODEL, input: items.map((item) => `${item.title}\n${(item.summary ?? '').slice(0, 1200)}`) }),
         signal: AbortSignal.timeout(60000),
       })
