@@ -4,7 +4,7 @@ import {
   openRouterClient,
 } from './openrouter'
 
-const EMBEDDINGS_MODEL = process.env.OPENROUTER_EMBEDDINGS_MODEL
+const EMBEDDINGS_MODEL = process.env.OPENROUTER_EMBEDDING_MODEL ?? 'sentence-transformers/all-minilm-l12-v2'
 
 const SUMMARY_CHAR_LIMIT = 1_200
 
@@ -14,8 +14,8 @@ function embeddingValue(item: EmbeddingInput) {
   return `${item.title}\n${(item.summary ?? '').slice(0, SUMMARY_CHAR_LIMIT)}`.trim()
 }
 
-function isValidEmbedding(embedding: number[] | undefined): embedding is number[] {
-  return Boolean(embedding?.length) && embedding!.every((value) => Number.isFinite(value))
+function isValidEmbedding(embedding: string | number[]): embedding is number[] {
+  return Array.isArray(embedding) && embedding.length > 0 && embedding.every((value) => Number.isFinite(value))
 }
 
 export async function generateArticleEmbeddings(
@@ -30,15 +30,19 @@ export async function generateArticleEmbeddings(
 
   try {
     const openrouter = await openRouterClient()
-    const embedding = await openrouter.embeddings.generate({
+    const response = await openrouter.embeddings.generate({
       requestBody: {
         model: EMBEDDINGS_MODEL,
         input: items.map(embeddingValue),
-        encodingFormat: "float"
-      }
-    });
+        encodingFormat: 'float',
+      },
+    })
 
-    const embeddings = [...(embedding.data ?? [])]
+    if (typeof response === 'string' || !('data' in response)) {
+      throw new Error('Embedding response did not contain vector data')
+    }
+
+    const embeddings = [...response.data]
       .sort((left, right) => (left.index ?? 0) - (right.index ?? 0))
       .map((entry) => entry.embedding)
 
