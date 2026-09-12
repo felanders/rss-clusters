@@ -1,308 +1,98 @@
 'use server'
 
-import { embedMany, generateText } from 'ai'
-import { createOpenRouter } from '@openrouter/ai-sdk-provider'
-import { getToken } from '@vercel/connect'
-import { XMLParser } from 'fast-xml-parser'
-import { and, desc, eq, gt, isNotNull } from 'drizzle-orm'
-import { z } from 'zod'
-import { headers } from 'next/headers'
 import { revalidatePath } from 'next/cache'
-import { auth } from '@/lib/auth'
-import { db } from '@/lib/db'
-import { article, cluster, feed } from '@/lib/db/schema'
+import { requireUserId } from '@/lib/auth-session'
+import {
+  createFeedForUser,
+  deleteFeedForUser,
+  listArticlesForUser,
+  listClustersForUser,
+  listFeedsForUser,
+  listReadArticleIdsForUser,
+  markArticleReadForUser,
+  reclusterArticlesForUser,
+  refreshAllFeedsForUser,
+  refreshAndClusterAllForUser,
+  refreshFeedForUser,
+  updateFeedForUser,
+} from '@/lib/feeds/service'
 
-async function userId(override?: string) {
-  if (override) return override
-  const session = await auth.api.getSession({ headers: await headers() })
-  if (!session?.user) throw new Error('Unauthorized')
-  return session.user.id
-}
-
-function asArray<T>(value: T | T[] | undefined) { return value === undefined ? [] : Array.isArray(value) ? value : [value] }
-function text(value: unknown) {
-  if (typeof value === 'string' || typeof value === 'number') return String(value)
-  if (value && typeof value === 'object' && '#text' in value) return String((value as { '#text': unknown })['#text'] ?? '')
-  return ''
-}
-
-function link(value: unknown) {
-  if (typeof value === 'string') return value
-  if (value && typeof value === 'object') {
-    const candidate = value as { '@_href'?: unknown; '#text'?: unknown }
-    return text(candidate['@_href']) || text(candidate['#text'])
-  }
-  return ''
-}
-
-const OPENROUTER_CONNECTOR_UID = process.env.OPENROUTER_CONNECTOR_UID
-if (!OPENROUTER_CONNECTOR_UID) throw new Error('OPENROUTER_CONNECTOR_UID is not configured')
-const CLUSTER_VERIFICATION_MODEL = process.env.OPENROUTER_CLUSTER_VERIFICATION_MODEL ?? 'google/gemini-3.5-flash-lite'
-const OPENROUTER_API_URL = process.env.OPENROUTER_API_URL ?? 'https://openrouter.ai/api/v1'
-const isDevelopment = process.env.NODE_ENV !== 'production'
-
-function devLog(message: string, details?: unknown) {
-  if (isDevelopment) console.log(`[v0] ${message}`, details ?? '')
-}
-
-function devError(message: string, error: unknown) {
-  if (isDevelopment) console.error(`[v0] ${message}`, error)
-}
-
-async function getOpenRouter() {
-  const token = await getToken(OPENROUTER_CONNECTOR_UID!, { subject: { type: 'app' } })
-  return createOpenRouter({ apiKey: token, baseURL: OPENROUTER_API_URL })
-}
-
-async function callClusterModel<T>(prompt: string, schema: z.ZodType<T>): Promise<T> {
-  devLog('Cluster model request started', { model: CLUSTER_VERIFICATION_MODEL, promptLength: prompt.length })
-  try {
-    const openrouter = await getOpenRouter()
-    const { text: responseText } = await generateText({
-      model: openrouter(CLUSTER_VERIFICATION_MODEL),
-      prompt,
-      temperature: 0.1,
-      abortSignal: AbortSignal.timeout(30000),
-    })
-    devLog('Cluster model response received', { responseLength: responseText.length, response: responseText })
-    if (!responseText) throw new Error('Cluster model returned no content')
-    const parsed = schema.parse(JSON.parse(responseText))
-    devLog('Cluster model response parsed', parsed)
-    return parsed
-  } catch (error) {
-    devError('Cluster model request failed', error)
-    throw error
-  }
-}
-
-const EMBEDDING_MODEL = process.env.OPENROUTER_EMBEDDING_MODEL ?? 'sentence-transformers/all-minilm-l12-v2'
-const LOCAL_CLUSTER_THRESHOLD = Number(process.env.LOCAL_CLUSTER_THRESHOLD ?? '0.55')
-
-type ClusterCandidate = { id: string; centroid: number[]; canonicalTitle: string; articleCount: number }
-
-function cosineSimilarity(left: number[], right: number[]) {
-  if (left.length !== right.length || left.length === 0) return 0
-  let dot = 0
-  let leftMagnitude = 0
-  let rightMagnitude = 0
-  for (let index = 0; index < left.length; index += 1) {
-    dot += left[index] * right[index]
-    leftMagnitude += left[index] ** 2
-    rightMagnitude += right[index] ** 2
-  }
-  const denominator = Math.sqrt(leftMagnitude) * Math.sqrt(rightMagnitude)
-  return denominator === 0 ? 0 : dot / denominator
-}
-
-function updatedCentroid(oldCentroid: number[], embedding: number[], articleCount: number) {
-  return embedding.map((value, index) => ((oldCentroid[index] * articleCount) + value) / (articleCount + 1))
-}
-
-async function generateArticleEmbeddings(items: Array<{ title: string; summary: string | null }>, userId: string) {
-  devLog('Embedding request started', { model: EMBEDDING_MODEL, articleCount: items.length })
-  try {
-    const openrouter = await getOpenRouter()
-    const values = items.map((item) => `${item.title}\n${(item.summary ?? '').slice(0, 1200)}`)
-    const { embeddings } = await embedMany({
-      model: openrouter.embedding(EMBEDDING_MODEL),
-      values,
-      maxRetries: 3,
-      abortSignal: AbortSignal.timeout(60000),
-    })
-    devLog('Embedding response received', { returned: embeddings.length, expected: items.length, dimensions: embeddings[0]?.length ?? 0 })
-    if (embeddings.length !== items.length || embeddings.some((embedding) => !embedding?.length || embedding.some((value) => !Number.isFinite(value)))) throw new Error('Embedding response was invalid')
-    return embeddings
-  } catch (error) {
-    devError('Embedding request failed', error)
-    throw error
-  }
-}
-
-async function synthesizeCluster(clusterId: string, userId: string) {
-  const rows = await db.select().from(article).where(and(eq(article.userId, userId), eq(article.clusterId, clusterId))).orderBy(desc(article.publishedAt)).limit(20)
-  if (rows.length < 2) return
-  const result = await callClusterModel(`You are a neutral news editor. Combine these related headlines and summaries into one concise canonical headline (max 12 words) and 2 key takeaway bullets. Return only JSON with canonical_title and summary.\n\n${rows.map((row) => `Headline: ${row.title}\nSummary: ${row.summary ?? ''}`).join('\n\n')}`, z.object({ canonical_title: z.string(), summary: z.array(z.string()).length(2) }))
-  await db.update(cluster).set({ canonicalTitle: result.canonical_title.slice(0, 500), summary: result.summary.map((item: string) => item.slice(0, 500)), lastUpdatedAt: new Date() }).where(and(eq(cluster.id, clusterId), eq(cluster.userId, userId)))
-}
-
-async function verifyClusterMatch(item: { title: string; summary: string | null }, candidate: ClusterCandidate, score: number, userId: string) {
-  const related = await db.select({ title: article.title, summary: article.summary }).from(article).where(and(eq(article.userId, userId), eq(article.clusterId, candidate.id))).orderBy(desc(article.publishedAt)).limit(5)
-  if (related.length === 0) return false
-  const result = await callClusterModel(`Decide whether this incoming news article reports the same real-world story as the existing cluster. Shared topic alone is not enough; require the same event, people, place, or development. Return related=true only when grouping is editorially defensible. Return JSON with related and reason.\n\nIncoming article:\nHeadline: ${item.title}\nSummary: ${item.summary ?? ''}\n\nExisting cluster (${candidate.articleCount} articles, local similarity ${score.toFixed(3)}):\n${related.map((row) => `Headline: ${row.title}\nSummary: ${row.summary ?? ''}`).join('\n\n')}`, z.object({ related: z.boolean(), reason: z.string().max(240) }))
-  return result.related
-}
-
-async function assignArticleToCluster(item: { id: string; userId: string; title: string; summary: string | null }, userId: string, embedding: number[]) {
-  const activeClusters = await db.select({ id: cluster.id, centroid: cluster.centroid, canonicalTitle: cluster.canonicalTitle, articleCount: cluster.articleCount }).from(cluster).where(and(eq(cluster.userId, userId), gt(cluster.lastUpdatedAt, new Date(Date.now() - 36 * 60 * 60 * 1000))))
-  const best = activeClusters.reduce<{ candidate: ClusterCandidate | null; score: number }>((result, current) => {
-    const score = cosineSimilarity(embedding, current.centroid)
-    return score > result.score ? { candidate: current, score } : result
-  }, { candidate: null, score: -1 })
-  const matchesCandidate = Boolean(best.candidate && best.score >= LOCAL_CLUSTER_THRESHOLD)
-  const verified = matchesCandidate ? await verifyClusterMatch(item, best.candidate!, best.score, userId) : false
-  const shouldAttach = matchesCandidate && verified
-  const clusterId = shouldAttach ? best.candidate!.id : crypto.randomUUID()
-  if (shouldAttach) {
-    await db.update(cluster).set({ centroid: updatedCentroid(best.candidate!.centroid, embedding, best.candidate!.articleCount), articleCount: best.candidate!.articleCount + 1, lastUpdatedAt: new Date() }).where(and(eq(cluster.id, clusterId), eq(cluster.userId, userId)))
-  } else {
-    await db.insert(cluster).values({ id: clusterId, userId, centroid: embedding, canonicalTitle: item.title.slice(0, 500), summary: [], articleCount: 1, lastUpdatedAt: new Date(), createdAt: new Date() })
-  }
-  await db.update(article).set({ embedding, clusterId }).where(and(eq(article.id, item.id), eq(article.userId, userId)))
-  const count = shouldAttach ? best.candidate!.articleCount + 1 : 1
-  if (count >= 2) {
-    try {
-      await synthesizeCluster(clusterId, userId)
-    } catch (error) {
-      console.error('[v0] Cluster synthesis failed:', clusterId, error)
-    }
-  }
-}
-
-async function fetchArticles(source: string) {
-  const response = await fetch(source, { headers: { accept: 'application/rss+xml, application/atom+xml, application/xml, text/xml' }, signal: AbortSignal.timeout(12000), cache: 'no-store' })
-  if (!response.ok) throw new Error(`Feed returned ${response.status}`)
-  const contentLength = Number(response.headers.get('content-length') ?? 0)
-  if (contentLength > 3_000_000) throw new Error('Feed is larger than 3 MB')
-  const xml = await response.text()
-  if (xml.length > 3_000_000) throw new Error('Feed is larger than 3 MB')
-  const parsed = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_' }).parse(xml)
-  const rss = parsed?.rss?.channel
-  const atom = parsed?.feed
-  const items = rss ? asArray(rss.item) : asArray(atom?.entry)
-  return { title: text(rss?.title) || text(atom?.title) || new URL(source).hostname, items: items.map((item: Record<string, unknown>) => ({ title: text(item.title) || 'Untitled article', url: link(item.link) || text(item.guid) || text(item.id), summary: text(item.description) || text(item.summary) || text(item.content), author: text(item.author) || text((item.author as Record<string, unknown> | undefined)?.name), publishedAt: text(item.pubDate) || text(item.published) || text(item.updated), guid: text(item.guid) || text(item.id) })).filter((item) => item.url) }
-}
+/**
+ * Thin session-scoped wrappers around lib/feeds/service.
+ * Every export here is a public endpoint, so none of them accept a user id.
+ * Scheduled runs call the service functions directly from the cron route.
+ */
 
 export async function listFeeds() {
-  const id = await userId()
-  return db.select().from(feed).where(eq(feed.userId, id)).orderBy(desc(feed.createdAt))
+  return listFeedsForUser(await requireUserId())
 }
 
 export async function listArticles() {
-  const id = await userId()
-  return db.select().from(article).where(eq(article.userId, id)).orderBy(desc(article.publishedAt), desc(article.createdAt))
-}
-
-export async function markArticleRead(articleId: string) {
-  const id = await userId()
-  await db.update(article).set({ readAt: new Date() }).where(and(eq(article.id, articleId), eq(article.userId, id)))
-  revalidatePath('/')
-}
-
-export async function listReadArticleIds() {
-  const id = await userId()
-  const rows = await db.select({ id: article.id }).from(article).where(and(eq(article.userId, id), isNotNull(article.readAt)))
-  return rows.map((row) => row.id)
+  return listArticlesForUser(await requireUserId())
 }
 
 export async function listClusters() {
-  const id = await userId()
-  return db.select().from(cluster).where(eq(cluster.userId, id)).orderBy(desc(cluster.lastUpdatedAt))
+  return listClustersForUser(await requireUserId())
 }
 
-export async function reclusterArticles(scheduledUserId?: string) {
-  const id = await userId(scheduledUserId)
-  const rows = await db.select({ id: article.id, userId: article.userId, title: article.title, summary: article.summary }).from(article).where(eq(article.userId, id))
-  const allEmbeddings: number[][] = []
-  const errors: string[] = []
-  const batchSize = 16
-  for (let start = 0; start < rows.length; start += batchSize) {
-    const batch = rows.slice(start, start + batchSize)
-    try {
-      allEmbeddings.push(...await generateArticleEmbeddings(batch, id))
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Embedding request failed'
-      errors.push(`Batch ${start + 1}-${start + batch.length}: ${message}`)
-    }
-  }
-  if (errors.length > 0 || allEmbeddings.length !== rows.length) {
-    return { processed: 0, total: rows.length, errors: [...errors, 'Existing persisted embeddings and clusters were preserved.'] }
-  }
+export async function listReadArticleIds() {
+  return listReadArticleIdsForUser(await requireUserId())
+}
 
-  await db.delete(cluster).where(eq(cluster.userId, id))
-  await db.update(article).set({ clusterId: null }).where(eq(article.userId, id))
-  let processed = 0
-  for (const [index, item] of rows.entries()) {
-    try {
-      await assignArticleToCluster(item, id, allEmbeddings[index])
-      processed += 1
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unknown clustering error'
-      errors.push(`${item.title.slice(0, 80)}: ${message}`)
-      console.error('[v0] Article clustering failed:', item.id, error)
-    }
-  }
+export async function markArticleRead(articleId: string) {
+  await markArticleReadForUser(articleId, await requireUserId())
   revalidatePath('/')
-  return { processed, total: rows.length, errors }
 }
 
 export async function addFeed(rawUrl: string) {
-  const id = await userId()
-  const normalized = rawUrl.trim().startsWith('http') ? rawUrl.trim() : `https://${rawUrl.trim()}`
-  const parsed = new URL(normalized)
-  if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('Only HTTP(S) feed URLs are supported')
-  const existing = await db.select({ id: feed.id }).from(feed).where(and(eq(feed.userId, id), eq(feed.url, parsed.toString())))
-  if (existing.length) throw new Error('That feed is already in your newsroom.')
-  const now = new Date()
-  const row = { id: crypto.randomUUID(), userId: id, name: parsed.hostname.replace(/^www\./, ''), url: parsed.toString(), category: 'Uncategorized', status: 'Pending sync', lastSyncedAt: null, lastError: null, createdAt: now, updatedAt: now }
-  await db.insert(feed).values(row)
-  await refreshFeed(row.id)
+  const userId = await requireUserId()
+  const row = await createFeedForUser(rawUrl, userId)
+
+  try {
+    await refreshFeedForUser(row.id, userId)
+  } catch {
+    // Keep the feed row with its error status so the user can retry.
+  }
+
   revalidatePath('/')
   return row
 }
 
 export async function updateFeed(feedId: string, values: { name?: string; category?: string }) {
-  const id = await userId()
-  await db.update(feed).set({ ...(values.name?.trim() ? { name: values.name.trim() } : {}), ...(values.category?.trim() ? { category: values.category.trim() } : {}), updatedAt: new Date() }).where(and(eq(feed.id, feedId), eq(feed.userId, id)))
+  await updateFeedForUser(feedId, await requireUserId(), values)
   revalidatePath('/')
 }
 
 export async function deleteFeed(feedId: string) {
-  const id = await userId()
-  await db.delete(article).where(and(eq(article.feedId, feedId), eq(article.userId, id)))
-  await db.delete(feed).where(and(eq(feed.id, feedId), eq(feed.userId, id)))
+  await deleteFeedForUser(feedId, await requireUserId())
   revalidatePath('/')
 }
 
-export async function refreshFeed(feedId: string, scheduledUserId?: string) {
-  const id = await userId(scheduledUserId)
-  const rows = await db.select().from(feed).where(and(eq(feed.id, feedId), eq(feed.userId, id)))
-  const current = rows[0]
-  if (!current) throw new Error('Feed not found')
+export async function refreshFeed(feedId: string) {
+  const userId = await requireUserId()
+
   try {
-    const result = await fetchArticles(current.url)
-    const now = new Date()
-    for (const item of result.items.slice(0, 100)) {
-      const inserted = await db.insert(article).values({ id: crypto.randomUUID(), feedId: current.id, userId: id, title: item.title.slice(0, 500), url: item.url.slice(0, 2000), summary: item.summary.slice(0, 5000) || null, author: item.author.slice(0, 300) || null, publishedAt: item.publishedAt ? new Date(item.publishedAt) : null, guid: item.guid.slice(0, 1000) || null }).onConflictDoNothing({ target: [article.feedId, article.url] }).returning({ id: article.id, title: article.title, summary: article.summary })
-      if (inserted[0]) {
-        try {
-          const [embedding] = await generateArticleEmbeddings([{ title: inserted[0].title, summary: inserted[0].summary }], id)
-          await assignArticleToCluster({ ...inserted[0], userId: id }, id, embedding)
-        } catch (error) {
-          console.error('[v0] Article embedding failed:', inserted[0].id, error)
-        }
-      }
-    }
-    const defaultName = new URL(current.url).hostname.replace(/^www\./, '')
-    const nextName = current.name === defaultName ? result.title.slice(0, 200) : current.name
-    await db.update(feed).set({ name: nextName, status: 'Healthy', lastSyncedAt: now, lastError: null, updatedAt: now }).where(and(eq(feed.id, feedId), eq(feed.userId, id)))
-  } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unable to refresh feed'
-    await db.update(feed).set({ status: 'Error', lastError: message.slice(0, 500), updatedAt: new Date() }).where(and(eq(feed.id, feedId), eq(feed.userId, id)))
-    throw new Error(message)
+    await refreshFeedForUser(feedId, userId)
+  } finally {
+    // Runs on the error path too, so the feed's Error status reaches the UI.
+    revalidatePath('/')
   }
-  revalidatePath('/')
 }
 
-export async function refreshAllFeeds(scheduledUserId?: string) {
-  const id = await userId(scheduledUserId)
-  const rows = await db.select().from(feed).where(eq(feed.userId, id))
-  const results = await Promise.allSettled(rows.map((item) => refreshFeed(item.id, id)))
+export async function refreshAllFeeds() {
+  const result = await refreshAllFeedsForUser(await requireUserId())
   revalidatePath('/')
-  return { refreshed: results.filter((result) => result.status === 'fulfilled').length, total: rows.length }
+  return result
 }
 
-export async function refreshAndClusterAll(scheduledUserId?: string) {
-  const refreshResult = await refreshAllFeeds(scheduledUserId)
-  const clusterResult = await reclusterArticles(scheduledUserId)
-  return { ...refreshResult, ...clusterResult }
+export async function reclusterArticles() {
+  const result = await reclusterArticlesForUser(await requireUserId())
+  revalidatePath('/')
+  return result
+}
+
+export async function refreshAndClusterAll() {
+  const result = await refreshAndClusterAllForUser(await requireUserId())
+  revalidatePath('/')
+  return result
 }
