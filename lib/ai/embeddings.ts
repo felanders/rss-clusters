@@ -4,23 +4,11 @@ import {
   openRouterClient,
 } from './openrouter'
 
-/**
- * OpenRouter has no embeddings endpoint, so embeddings use a separate
- * OpenAI-compatible provider. Implemented with plain `fetch` to avoid adding a
- * provider dependency.
- */
-const EMBEDDINGS_API_URL = process.env.OPENROUTER_API_URL 
 const EMBEDDINGS_MODEL = process.env.OPENROUTER_EMBEDDINGS_MODEL
 
-const EMBEDDING_TIMEOUT_MS = 60_000
 const SUMMARY_CHAR_LIMIT = 1_200
 
 export type EmbeddingInput = { title: string; summary: string | null }
-
-type EmbeddingsResponse = {
-  data?: Array<{ index?: number; embedding?: number[] }>
-  error?: { message?: string }
-}
 
 function embeddingValue(item: EmbeddingInput) {
   return `${item.title}\n${(item.summary ?? '').slice(0, SUMMARY_CHAR_LIMIT)}`.trim()
