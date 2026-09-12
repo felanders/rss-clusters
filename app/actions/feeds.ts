@@ -33,7 +33,8 @@ function link(value: unknown) {
   return ''
 }
 
-const OPENROUTER_CONNECTOR = 'openrouter.ai/clustered-rss-feeds-openrouter'
+const OPENROUTER_CONNECTOR_UID = process.env.OPENROUTER_CONNECTOR_UID
+if (!OPENROUTER_CONNECTOR_UID) throw new Error('OPENROUTER_CONNECTOR_UID is not configured')
 const CLUSTER_VERIFICATION_MODEL = 'google/gemini-3.5-flash-lite'
 
 async function callClusterModel<T>(prompt: string, schema: z.ZodType<T>): Promise<T> {
