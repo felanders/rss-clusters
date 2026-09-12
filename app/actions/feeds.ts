@@ -39,7 +39,6 @@ const OPENROUTER_CONNECTOR_UID = process.env.OPENROUTER_CONNECTOR_UID
 if (!OPENROUTER_CONNECTOR_UID) throw new Error('OPENROUTER_CONNECTOR_UID is not configured')
 const CLUSTER_VERIFICATION_MODEL = process.env.OPENROUTER_CLUSTER_VERIFICATION_MODEL ?? 'google/gemini-3.5-flash-lite'
 const OPENROUTER_API_URL = process.env.OPENROUTER_API_URL ?? 'https://openrouter.ai/api/v1'
-const OPENROUTER_APP_TITLE = process.env.OPENROUTER_APP_TITLE ?? 'Clustered RSS Feeds'
 const isDevelopment = process.env.NODE_ENV !== 'production'
 
 function devLog(message: string, details?: unknown) {
@@ -52,7 +51,7 @@ function devError(message: string, error: unknown) {
 
 async function getOpenRouter() {
   const token = await getToken(OPENROUTER_CONNECTOR_UID!, { subject: { type: 'app' } })
-  return createOpenRouter({ apiKey: token, baseURL: OPENROUTER_API_URL, headers: { 'X-Title': OPENROUTER_APP_TITLE } })
+  return createOpenRouter({ apiKey: token, baseURL: OPENROUTER_API_URL })
 }
 
 async function callClusterModel<T>(prompt: string, schema: z.ZodType<T>): Promise<T> {
