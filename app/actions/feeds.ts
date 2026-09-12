@@ -38,7 +38,7 @@ if (!OPENROUTER_CONNECTOR_UID) throw new Error('OPENROUTER_CONNECTOR_UID is not 
 const CLUSTER_VERIFICATION_MODEL = 'google/gemini-3.5-flash-lite'
 
 async function callClusterModel<T>(prompt: string, schema: z.ZodType<T>): Promise<T> {
-  const token = await getToken(OPENROUTER_CONNECTOR, { subject: { type: 'app' } })
+  const token = await getToken(OPENROUTER_CONNECTOR_UID!, { subject: { type: 'app' } })
   const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'X-Title': 'Clustered RSS Feeds' },
@@ -76,7 +76,7 @@ function updatedCentroid(oldCentroid: number[], embedding: number[], articleCoun
 }
 
 async function generateArticleEmbeddings(items: Array<{ title: string; summary: string | null }>) {
-  const token = await getToken(OPENROUTER_CONNECTOR, { subject: { type: 'app' } })
+  const token = await getToken(OPENROUTER_CONNECTOR_UID!, { subject: { type: 'app' } })
   let response: Response | undefined
   for (let attempt = 0; attempt < 4; attempt += 1) {
     response = await fetch('https://openrouter.ai/api/v1/embeddings', {
